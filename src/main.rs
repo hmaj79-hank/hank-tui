@@ -730,7 +730,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             let input_title = if app.loading {
                 " Warte... "
             } else if app.focus == Focus::Input {
-                " Nachricht [Enter=Senden, Shift+Enter=Neue Zeile, F1=Hilfe] "
+                " Nachricht [Ctrl+S=Senden, F1=Hilfe] "
             } else {
                 " Nachricht [Tab=Fokussieren] "
             };
@@ -807,8 +807,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     Line::from("  Esc, Ctrl+C   Beenden"),
                     Line::from(""),
                     Line::from(Span::styled("── Eingabe (Input fokussiert) ──", Style::default().fg(Color::Cyan))),
-                    Line::from("  Enter         Nachricht senden"),
-                    Line::from("  Shift+Enter   Neue Zeile"),
+                    Line::from("  Ctrl+S        Nachricht senden"),
+                    Line::from("  Enter         Neue Zeile"),
                     Line::from("  Ctrl+V        Einfügen aus Zwischenablage"),
                     Line::from("  ↑/↓           Cursor zwischen Zeilen bewegen"),
                     Line::from("  ←/→           Cursor links/rechts"),
@@ -1424,15 +1424,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                     }
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) && app.focus == Focus::Input => {
-                        // Insert newline with Shift+Enter
-                        let byte_pos: usize = app.input.chars().take(app.cursor_pos).map(|c| c.len_utf8()).sum();
-                        app.input.insert(byte_pos, '\n');
-                        app.cursor_pos += 1;
-                        app.history_index = None;
-                    }
                     KeyCode::Enter if app.focus == Focus::Input => {
-                        // Send message with Enter
+                        // Insert newline with Enter
                         if !app.input.trim().is_empty() {
                             let user_msg = app.input.trim().to_string();
                             

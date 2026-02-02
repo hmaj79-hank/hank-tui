@@ -18,7 +18,7 @@ Das hier ist das Ergebnis.
 
 ## Features
 
-- 📝 **Multi-line Input** – Shift+Enter für neue Zeile, Enter zum Senden
+- 📝 **Multi-line Input** – Enter für neue Zeile, Ctrl+S zum Senden
 - ⬆️⬇️ **Cursor-Navigation** – Pfeiltasten bewegen den Cursor wie erwartet
 - 📜 **Command History** – Ctrl+↑/↓ für vorherige Nachrichten
 - 📋 **Clipboard** – Ctrl+V zum Einfügen
@@ -62,8 +62,8 @@ port = 8080
 
 | Taste | Aktion |
 |-------|--------|
-| `Enter` | Nachricht senden |
-| `Shift+Enter` | Neue Zeile |
+| `Ctrl+S` | Nachricht senden |
+| `Enter` | Neue Zeile |
 | `Tab` | Fokus wechseln (Input ↔ Chat) |
 | `↑/↓` | Cursor in Zeilen bewegen |
 | `Ctrl+↑/↓` | Command History |

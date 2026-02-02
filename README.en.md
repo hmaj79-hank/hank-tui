@@ -18,7 +18,7 @@ This is the result.
 
 ## Features
 
-- 📝 **Multi-line Input** – Shift+Enter for new line, Enter to send
+- 📝 **Multi-line Input** – Enter for new line, Ctrl+S to send
 - ⬆️⬇️ **Cursor Navigation** – Arrow keys move the cursor as expected
 - 📜 **Command History** – Ctrl+↑/↓ for previous messages
 - 📋 **Clipboard** – Ctrl+V to paste
@@ -62,8 +62,8 @@ port = 8080
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Send message |
-| `Shift+Enter` | New line |
+| `Ctrl+S` | Send message |
+| `Enter` | New line |
 | `Tab` | Switch focus (Input ↔ Chat) |
 | `↑/↓` | Move cursor in lines |
 | `Ctrl+↑/↓` | Command history |
