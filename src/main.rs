@@ -1,50 +1,169 @@
+use arboard::Clipboard;
+use chrono::{Local, TimeZone};
+use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
 use serde::{Deserialize, Serialize};
-use std::{env, fs, io, path::PathBuf};
-use unicode_width::UnicodeWidthStr;
-use chrono::Local;
+use std::{fs, io, panic, path::PathBuf, time::Instant};
+use unicode_width::UnicodeWidthChar;
+
+#[derive(Parser, Debug)]
+#[command(name = "hank-tui")]
+#[command(about = "Terminal UI for Hank chat server", long_about = None)]
+struct Args {
+    /// Host to connect to (can also be set via HANK_HOST environment variable)
+    #[arg(short = 'H', long)]
+    host: Option<String>,
+
+    /// Port to connect to (can also be set via HANK_PORT environment variable)
+    #[arg(short, long)]
+    port: Option<u16>,
+    
+    /// Disable chat history (do not load or save)
+    #[arg(long)]
+    no_history: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct Config {
+    host: String,
+    port: u16,
+}
+
+impl Config {
+    fn config_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|mut path| {
+            path.push("hank-tui");
+            path.push("config.toml");
+            path
+        })
+    }
+
+    fn load() -> Self {
+        Self::config_path()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|content| toml::from_str(&content).ok())
+            .unwrap_or_else(|| Config {
+                host: "localhost".to_string(),
+                port: 8080,
+            })
+    }
+
+    fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(path) = Self::config_path() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let content = toml::to_string_pretty(self)?;
+            fs::write(path, content)?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Message {
     role: String,
     content: String,
+    timestamp: String,
+    #[serde(default)]
+    timestamp_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Session {
-    name: String,
-    created: String,
+struct ChatHistory {
+    server_url: String,
     messages: Vec<Message>,
+    saved_at: String,
+}
+
+impl ChatHistory {
+    fn history_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|mut path| {
+            path.push("hank-tui");
+            path.push("history.json");
+            path
+        })
+    }
+
+    fn load() -> Option<Self> {
+        Self::history_path()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|content| serde_json::from_str(&content).ok())
+    }
+
+    fn save(server_url: &str, messages: &[Message]) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(path) = Self::history_path() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            
+            // Only save last 100 messages
+            let messages_to_save: Vec<Message> = messages
+                .iter()
+                .rev()
+                .take(100)
+                .rev()
+                .cloned()
+                .collect();
+            
+            let history = ChatHistory {
+                server_url: server_url.to_string(),
+                messages: messages_to_save,
+                saved_at: Local::now().to_rfc3339(),
+            };
+            
+            let content = serde_json::to_string_pretty(&history)?;
+            fs::write(path, content)?;
+        }
+        Ok(())
+    }
+    
+    fn delete() -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(path) = Self::history_path() {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(PartialEq)]
-enum Mode {
-    Normal,
-    SessionPicker,
+enum Focus {
+    Input,
+    Chat,
+    Help,
 }
 
 struct App {
     input: String,
-    cursor_pos: usize,  // Cursor-Position in Zeichen (nicht Bytes)
+    cursor_pos: usize,
     messages: Vec<Message>,
     server_url: String,
     loading: bool,
     scroll: u16,
-    mode: Mode,
-    sessions: Vec<String>,
-    session_list_state: ListState,
+    input_scroll: u16,  // Scroll offset for input field
+    command_history: Vec<String>,
+    history_index: Option<usize>,
+    connection_status: String,
+    last_error: Option<String>,
+    auto_scroll: bool,
+    focus: Focus,
+    history_enabled: bool,
+    last_timestamp: u64,
+    last_poll: Instant,
 }
 
 #[derive(Serialize)]
@@ -55,287 +174,506 @@ struct ChatRequest {
 #[derive(Deserialize)]
 struct ChatResponse {
     content: String,
+    #[allow(dead_code)]
     complete: bool,
 }
 
-fn sessions_dir() -> PathBuf {
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("hank-tui")
-        .join("sessions");
-    fs::create_dir_all(&config_dir).ok();
-    config_dir
+#[derive(Deserialize)]
+struct ServerMessage {
+    role: String,
+    content: String,
+    timestamp: u64,
 }
 
-fn list_sessions() -> Vec<String> {
-    let dir = sessions_dir();
-    let mut sessions: Vec<String> = fs::read_dir(&dir)
-        .ok()
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if name.ends_with(".json") {
-                        Some(name.trim_end_matches(".json").to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    sessions.sort();
-    sessions.reverse(); // Neueste zuerst
-    sessions
-}
-
-fn save_session(messages: &[Message]) -> Result<String, Box<dyn std::error::Error>> {
-    let name = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
-    let session = Session {
-        name: name.clone(),
-        created: Local::now().to_rfc3339(),
-        messages: messages.to_vec(),
-    };
-    let path = sessions_dir().join(format!("{}.json", name));
-    fs::write(&path, serde_json::to_string_pretty(&session)?)?;
-    Ok(name)
-}
-
-fn load_session(name: &str) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
-    let path = sessions_dir().join(format!("{}.json", name));
-    let data = fs::read_to_string(&path)?;
-    let session: Session = serde_json::from_str(&data)?;
-    Ok(session.messages)
+enum PollEvent {
+    Messages(Vec<Message>),
+    Error(String),
 }
 
 impl App {
-    fn new(server_url: String) -> Self {
+    fn new(server_url: String, history_enabled: bool) -> Self {
+        let mut messages = Vec::new();
+        
+        // Load history if enabled
+        if history_enabled {
+            if let Some(history) = ChatHistory::load() {
+                if history.server_url == server_url {
+                    messages = history.messages;
+                    messages.push(Message {
+                        role: "system".to_string(),
+                        content: format!("Historie geladen ({} Nachrichten) - {}", 
+                            messages.len(), history.saved_at),
+                        timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                    });
+                } else {
+                    messages.push(Message {
+                        role: "system".to_string(),
+                        content: format!("Neue Session für {}", server_url),
+                        timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                    });
+                }
+            } else {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: format!("Verbunden mit {} (History aktiviert)", server_url),
+                    timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                });
+            }
+        } else {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: format!("Verbunden mit {} (History deaktiviert)", server_url),
+                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+            });
+        }
+        
+        let last_timestamp = messages
+            .iter()
+            .filter_map(|m| m.timestamp_ms)
+            .max()
+            .unwrap_or(0);
+
         Self {
             input: String::new(),
             cursor_pos: 0,
-            messages: Vec::new(),  // Start mit leerem Chat
+            messages,
             server_url,
             loading: false,
             scroll: 0,
-            mode: Mode::Normal,
-            sessions: Vec::new(),
-            session_list_state: ListState::default(),
+            input_scroll: 0,
+            command_history: Vec::new(),
+            history_index: None,
+            connection_status: "Connected".to_string(),
+            last_error: None,
+            auto_scroll: true,
+            focus: Focus::Input,
+            history_enabled,
+            last_timestamp,
+            last_poll: Instant::now(),
         }
     }
 
-    fn insert_char(&mut self, c: char) {
-        let byte_pos = self.input
-            .char_indices()
-            .nth(self.cursor_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len());
-        self.input.insert(byte_pos, c);
-        self.cursor_pos += 1;
-    }
-
-    fn delete_char_before_cursor(&mut self) {
-        if self.cursor_pos > 0 {
-            self.cursor_pos -= 1;
-            let byte_pos = self.input
-                .char_indices()
-                .nth(self.cursor_pos)
-                .map(|(i, _)| i)
-                .unwrap_or(self.input.len());
-            let next_byte = self.input
-                .char_indices()
-                .nth(self.cursor_pos + 1)
-                .map(|(i, _)| i)
-                .unwrap_or(self.input.len());
-            self.input.replace_range(byte_pos..next_byte, "");
+    fn navigate_history_up(&mut self) {
+        if self.command_history.is_empty() {
+            return;
         }
-    }
-
-    fn delete_char_at_cursor(&mut self) {
-        let char_count = self.input.chars().count();
-        if self.cursor_pos < char_count {
-            let byte_pos = self.input
-                .char_indices()
-                .nth(self.cursor_pos)
-                .map(|(i, _)| i)
-                .unwrap_or(self.input.len());
-            let next_byte = self.input
-                .char_indices()
-                .nth(self.cursor_pos + 1)
-                .map(|(i, _)| i)
-                .unwrap_or(self.input.len());
-            self.input.replace_range(byte_pos..next_byte, "");
-        }
-    }
-
-    fn move_cursor_left(&mut self) {
-        self.cursor_pos = self.cursor_pos.saturating_sub(1);
-    }
-
-    fn move_cursor_right(&mut self) {
-        let char_count = self.input.chars().count();
-        if self.cursor_pos < char_count {
-            self.cursor_pos += 1;
-        }
-    }
-
-    fn cursor_position(&self, input_width: u16) -> (u16, u16) {
-        // Berechne Cursor-Position unter Berücksichtigung von Wort-Wrap
-        // ratatui wrapped bei Wortgrenzen, nicht mitten im Wort
-        let text_before_cursor: String = self.input.chars().take(self.cursor_pos).collect();
         
-        let mut x: u16 = 0;
-        let mut y: u16 = 0;
+        let new_index = match self.history_index {
+            None => Some(self.command_history.len() - 1),
+            Some(0) => Some(0),
+            Some(i) => Some(i - 1),
+        };
         
-        for c in text_before_cursor.chars() {
-            let char_width = UnicodeWidthStr::width(c.to_string().as_str()) as u16;
+        if let Some(idx) = new_index {
+            self.history_index = Some(idx);
+            self.input = self.command_history[idx].clone();
+            self.cursor_pos = self.input.len();
+        }
+    }
+
+    fn navigate_history_down(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+        
+        match self.history_index {
+            None => {}
+            Some(i) if i >= self.command_history.len() - 1 => {
+                self.history_index = None;
+                self.input.clear();
+                self.cursor_pos = 0;
+            }
+            Some(i) => {
+                self.history_index = Some(i + 1);
+                self.input = self.command_history[i + 1].clone();
+                self.cursor_pos = self.input.len();
+            }
+        }
+    }
+    
+    fn scroll_to_bottom(&mut self) {
+        self.scroll = 0;
+        self.auto_scroll = true;
+    }
+    
+    fn scroll_up(&mut self) {
+        self.auto_scroll = false;
+        self.scroll = self.scroll.saturating_add(1);
+    }
+    
+    fn scroll_down(&mut self) {
+        if self.scroll > 0 {
+            self.scroll = self.scroll.saturating_sub(1);
+        }
+        if self.scroll == 0 {
+            self.auto_scroll = true;
+        }
+    }
+    
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Input => Focus::Chat,
+            Focus::Chat => Focus::Input,
+            Focus::Help => Focus::Input,
+        };
+    }
+    
+    fn toggle_help(&mut self) {
+        self.focus = match self.focus {
+            Focus::Help => Focus::Input,
+            _ => Focus::Help,
+        };
+    }
+    
+    /// Calculate cursor line and column for given width (accounting for wrapping and newlines)
+    fn cursor_line_col(&self, width: usize) -> (usize, usize) {
+        if width == 0 {
+            return (0, 0);
+        }
+        
+        let mut line = 0;
+        let mut col = 0;
+        
+        for (i, ch) in self.input.chars().enumerate() {
+            // Return position BEFORE processing this character
+            if i == self.cursor_pos {
+                return (line, col);
+            }
             
-            // Prüfen ob das nächste Zeichen noch passt
-            if x + char_width > input_width {
-                // Neue Zeile
-                y += 1;
-                x = char_width;
+            if ch == '\n' {
+                line += 1;
+                col = 0;
             } else {
-                x += char_width;
+                let char_width = ch.width().unwrap_or(1);
+                // Wrap BEFORE adding character if it would exceed width
+                if col + char_width > width {
+                    line += 1;
+                    col = 0;
+                }
+                col += char_width;
             }
         }
         
-        (x, y)
+        // Cursor is at the end of input
+        (line, col)
     }
-
-    fn open_session_picker(&mut self) {
-        self.sessions = list_sessions();
-        self.session_list_state = ListState::default();
-        if !self.sessions.is_empty() {
-            self.session_list_state.select(Some(0));
+    
+    /// Calculate total lines for input (accounting for wrapping and newlines)
+    fn input_total_lines(&self, width: usize) -> usize {
+        if width == 0 || self.input.is_empty() {
+            return 1;
         }
-        self.mode = Mode::SessionPicker;
-    }
-
-    fn close_session_picker(&mut self) {
-        self.mode = Mode::Normal;
-    }
-
-    fn session_picker_up(&mut self) {
-        if self.sessions.is_empty() {
-            return;
-        }
-        let i = match self.session_list_state.selected() {
-            Some(i) => i.saturating_sub(1),
-            None => 0,
-        };
-        self.session_list_state.select(Some(i));
-    }
-
-    fn session_picker_down(&mut self) {
-        if self.sessions.is_empty() {
-            return;
-        }
-        let i = match self.session_list_state.selected() {
-            Some(i) => (i + 1).min(self.sessions.len() - 1),
-            None => 0,
-        };
-        self.session_list_state.select(Some(i));
-    }
-
-    fn load_selected_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(i) = self.session_list_state.selected() {
-            if let Some(name) = self.sessions.get(i) {
-                self.messages = load_session(name)?;
-                self.scroll = 0;
+        
+        let mut lines = 1;
+        let mut col = 0;
+        
+        for ch in self.input.chars() {
+            if ch == '\n' {
+                lines += 1;
+                col = 0;
+            } else {
+                let char_width = ch.width().unwrap_or(1);
+                // Wrap BEFORE adding character if it would exceed width
+                if col + char_width > width {
+                    lines += 1;
+                    col = 0;
+                }
+                col += char_width;
             }
         }
-        self.mode = Mode::Normal;
-        Ok(())
+        
+        lines
     }
-
-    fn save_current_session(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        // Nur speichern wenn es was zu speichern gibt
-        let saveable: Vec<_> = self.messages
-            .iter()
-            .filter(|m| m.role == "user" || m.role == "assistant")
-            .cloned()
-            .collect();
-        if saveable.is_empty() {
-            return Ok("Nichts zu speichern".to_string());
+    
+    /// Move cursor up one line in input
+    fn cursor_up(&mut self, width: usize) {
+        if width == 0 {
+            return;
         }
-        save_session(&saveable)
+        
+        let (line, target_col) = self.cursor_line_col(width);
+        
+        if line == 0 {
+            return; // Already at first line
+        }
+        
+        // Find position at same column in previous line
+        let target_line = line - 1;
+        let mut current_line = 0;
+        let mut current_col = 0;
+        let mut last_pos_on_target_line = 0;
+        
+        for (i, ch) in self.input.chars().enumerate() {
+            if current_line == target_line {
+                last_pos_on_target_line = i;
+                if current_col >= target_col {
+                    self.cursor_pos = i;
+                    return;
+                }
+            }
+            if current_line > target_line {
+                // Went past target line
+                self.cursor_pos = last_pos_on_target_line;
+                return;
+            }
+            
+            if ch == '\n' {
+                if current_line == target_line {
+                    // End of target line before reaching column
+                    self.cursor_pos = i;
+                    return;
+                }
+                current_line += 1;
+                current_col = 0;
+            } else {
+                let char_width = ch.width().unwrap_or(1);
+                // Wrap BEFORE if would exceed
+                if current_col + char_width > width {
+                    if current_line == target_line {
+                        // End of target line (wrapped)
+                        self.cursor_pos = i;
+                        return;
+                    }
+                    current_line += 1;
+                    current_col = 0;
+                }
+                current_col += char_width;
+            }
+        }
+        
+        self.cursor_pos = last_pos_on_target_line.min(self.input.len());
+    }
+    
+    /// Move cursor down one line in input
+    fn cursor_down(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        
+        let (line, target_col) = self.cursor_line_col(width);
+        let total_lines = self.input_total_lines(width);
+        
+        if line >= total_lines - 1 {
+            return; // Already at last line
+        }
+        
+        // Find position at same column in next line
+        let target_line = line + 1;
+        let mut current_line = 0;
+        let mut current_col = 0;
+        let mut last_pos_on_target_line = self.input.len();
+        
+        for (i, ch) in self.input.chars().enumerate() {
+            if current_line == target_line {
+                last_pos_on_target_line = i;
+                if current_col >= target_col {
+                    self.cursor_pos = i;
+                    return;
+                }
+            }
+            
+            if ch == '\n' {
+                if current_line == target_line {
+                    // End of target line before reaching column
+                    self.cursor_pos = i;
+                    return;
+                }
+                current_line += 1;
+                current_col = 0;
+            } else {
+                let char_width = ch.width().unwrap_or(1);
+                // Wrap BEFORE if would exceed
+                if current_col + char_width > width {
+                    if current_line == target_line {
+                        // End of target line (wrapped)
+                        self.cursor_pos = i;
+                        return;
+                    }
+                    current_line += 1;
+                    current_col = 0;
+                }
+                current_col += char_width;
+            }
+        }
+        
+        // Cursor ends up at end of input if target line is last
+        self.cursor_pos = self.input.len();
+    }
+    
+    /// Update input scroll to keep cursor visible
+    fn update_input_scroll(&mut self, width: usize, visible_lines: u16) {
+        if width == 0 || visible_lines == 0 {
+            return;
+        }
+        
+        let (cursor_line, _) = self.cursor_line_col(width);
+        let cursor_line = cursor_line as u16;
+        
+        // Scroll up if cursor is above visible area
+        if cursor_line < self.input_scroll {
+            self.input_scroll = cursor_line;
+        }
+        // Scroll down if cursor is below visible area
+        if cursor_line >= self.input_scroll + visible_lines {
+            self.input_scroll = cursor_line - visible_lines + 1;
+        }
+    }
+    
+    /// Wrap text manually using character-wrapping (not word-wrapping)
+    /// This ensures cursor calculation matches display exactly
+    fn wrap_text_for_display(&self, width: usize) -> String {
+        if width == 0 {
+            return self.input.clone();
+        }
+        
+        let mut result = String::with_capacity(self.input.len() + self.input.len() / width);
+        let mut col = 0;
+        
+        for ch in self.input.chars() {
+            if ch == '\n' {
+                result.push(ch);
+                col = 0;
+            } else {
+                let char_width = ch.width().unwrap_or(1);
+                // Wrap BEFORE adding character if it would exceed width
+                if col + char_width > width {
+                    result.push('\n');
+                    col = 0;
+                }
+                result.push(ch);
+                col += char_width;
+            }
+        }
+        
+        result
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+fn format_timestamp(ms: u64) -> String {
+    let ts = chrono::Local.timestamp_millis_opt(ms as i64).single();
+    match ts {
+        Some(t) => t.format("%H:%M:%S").to_string(),
+        None => Local::now().format("%H:%M:%S").to_string(),
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server_url = env::var("HANK_SERVER")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let args = Args::parse();
+    let mut config = Config::load();
+    
+    // Priority: CLI args > environment variables > config file > defaults
+    let host = args.host
+        .or_else(|| std::env::var("HANK_HOST").ok())
+        .unwrap_or(config.host.clone());
+    
+    let port = args.port
+        .or_else(|| std::env::var("HANK_PORT").ok().and_then(|p| p.parse().ok()))
+        .unwrap_or(config.port);
+    
+    // Update config with the values being used
+    config.host = host.clone();
+    config.port = port;
+    
+    // Save config for next time (ignore errors)
+    let _ = config.save();
+    
+    let server_url = format!("http://{}:{}", host, port);
 
+    // Setup panic handler to restore terminal
+    let original_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(panic_info);
+    }));
+
+    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    
+    // Clear the terminal to prevent any echo issues
+    terminal.clear()?;
 
-    let mut app = App::new(server_url);
+    let mut app = App::new(server_url.clone(), !args.no_history);
 
+    let result = run_app(&mut terminal, &mut app).await;
+
+    // Save history on exit if enabled
+    if app.history_enabled {
+        let _ = ChatHistory::save(&server_url, &app.messages);
+    }
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+async fn run_app<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         terminal.draw(|f| {
+            // Fixed input height of 5 lines
+            let input_height = 5u16;
+
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(3),
-                    Constraint::Length(3),
+                    Constraint::Length(input_height),
+                    Constraint::Length(1),
                 ])
                 .split(f.area());
 
-            // Chat-Verlauf
+            // Chat-Verlauf mit Timestamps
             let mut lines: Vec<Line> = Vec::new();
-            
-            if app.messages.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "Neuer Chat - Ctrl+O zum Laden einer Session",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-                )));
-            }
-            
             for msg in &app.messages {
                 let (prefix, style) = match msg.role.as_str() {
                     "user" => ("Du: ", Style::default().fg(Color::Cyan)),
                     "assistant" => ("Hank: ", Style::default().fg(Color::Green)),
                     "system" => ("", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+                    "error" => ("Error: ", Style::default().fg(Color::Red)),
                     _ => ("", Style::default()),
                 };
                 
-                for (i, line) in msg.content.lines().enumerate() {
-                    if i == 0 {
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                            Span::styled(line, style),
-                        ]));
-                    } else {
+                // Timestamp für non-system messages
+                if !msg.role.is_empty() && msg.role != "system" {
+                    lines.push(Line::from(vec![
+                        Span::styled(&msg.timestamp, Style::default().fg(Color::DarkGray)),
+                        Span::raw(" "),
+                        Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                        Span::styled(msg.content.lines().next().unwrap_or(""), style),
+                    ]));
+                    
+                    // Weitere Zeilen
+                    for line in msg.content.lines().skip(1) {
                         lines.push(Line::from(Span::styled(
-                            format!("{:width$}{}", "", line, width = prefix.width()),
+                            format!("{:width$}{}", "", line, width = msg.timestamp.len() + 1 + prefix.len()),
                             style,
                         )));
                     }
+                } else {
+                    lines.push(Line::from(Span::styled(&msg.content, style)));
                 }
                 lines.push(Line::from(""));
             }
@@ -347,16 +685,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )));
             }
 
+            // Show last error if any
+            if let Some(ref err) = app.last_error {
+                lines.push(Line::from(Span::styled(
+                    format!("⚠ {}", err),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+
+            // Calculate scroll offset for chat
+            let total_lines = lines.len() as u16;
+            let visible_lines = chunks[0].height.saturating_sub(2);
+            let max_scroll = total_lines.saturating_sub(visible_lines);
+            
+            let scroll_offset = if app.auto_scroll {
+                max_scroll
+            } else {
+                max_scroll.saturating_sub(app.scroll)
+            };
+
+            // Chat widget with focus indicator
+            let chat_title = if app.focus == Focus::Chat {
+                " Chat [FOKUSSIERT - ↑↓=Scroll, Tab=Wechsel] "
+            } else {
+                " Chat [Tab=Fokussieren] "
+            };
+            
+            let chat_block = Block::default()
+                .borders(Borders::ALL)
+                .title(chat_title)
+                .border_style(if app.focus == Focus::Chat {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                });
+
             let messages_widget = Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(" Chat "))
+                .block(chat_block)
                 .wrap(Wrap { trim: false })
-                .scroll((app.scroll, 0));
+                .scroll((scroll_offset, 0));
             f.render_widget(messages_widget, chunks[0]);
 
-            // Input
-            let input_title = " Nachricht (Enter=senden, Ctrl+S=speichern, Ctrl+O=laden, Esc=beenden) ";
-            let input_widget = Paragraph::new(app.input.as_str())
-                .block(Block::default().borders(Borders::ALL).title(input_title))
+            // Input with wrapping and focus indicator
+            let input_title = if app.loading {
+                " Warte... "
+            } else if app.focus == Focus::Input {
+                " Nachricht [Ctrl+S=Senden, F1=Hilfe] "
+            } else {
+                " Nachricht [Tab=Fokussieren] "
+            };
+            
+            let input_block = Block::default()
+                .borders(Borders::ALL)
+                .title(input_title)
+                .border_style(if app.focus == Focus::Input && !app.loading {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                });
+            
+            // Calculate input dimensions
+            let input_area_width = chunks[1].width.saturating_sub(2) as usize;
+            let visible_input_lines = input_height.saturating_sub(2);
+            
+            // Update scroll to keep cursor visible
+            app.update_input_scroll(input_area_width, visible_input_lines);
+            
+            // Use manually wrapped text to ensure cursor matches display
+            let wrapped_input = app.wrap_text_for_display(input_area_width);
+            let input_widget = Paragraph::new(wrapped_input)
+                .block(input_block)
+                .scroll((app.input_scroll, 0))
                 .style(if app.loading {
                     Style::default().fg(Color::DarkGray)
                 } else {
@@ -364,130 +763,422 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             f.render_widget(input_widget, chunks[1]);
 
-            // Cursor - korrekte Position mit Unicode-Breite und Wrap
-            if !app.loading && app.mode == Mode::Normal {
-                let input_width = chunks[1].width.saturating_sub(2); // Abzüglich Borders
-                let (cursor_x, cursor_y) = app.cursor_position(input_width);
-                
-                f.set_cursor_position((
-                    chunks[1].x + 1 + cursor_x,
-                    chunks[1].y + 1 + cursor_y
-                ));
-            }
+            // Status bar
+            let scroll_info = if app.focus == Focus::Chat && !app.auto_scroll {
+                format!(" Scroll: {} |", app.scroll)
+            } else {
+                String::new()
+            };
+            let status_text = format!(
+                " {} |{} History: {} | {}",
+                app.server_url,
+                scroll_info,
+                app.command_history.len(),
+                app.connection_status
+            );
+            let status_widget = Paragraph::new(status_text)
+                .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+            f.render_widget(status_widget, chunks[2]);
 
-            // Session-Picker Popup
-            if app.mode == Mode::SessionPicker {
-                let area = centered_rect(60, 60, f.area());
-                f.render_widget(Clear, area);
+            // Cursor positioning (only when input is focused)
+            if !app.loading && app.focus == Focus::Input {
+                let input_width = chunks[1].width.saturating_sub(2) as usize;
+                if input_width > 0 {
+                    let (cursor_line, cursor_col) = app.cursor_line_col(input_width);
+                    let visible_line = (cursor_line as u16).saturating_sub(app.input_scroll);
+                    
+                    if visible_line < visible_input_lines {
+                        f.set_cursor_position((
+                            chunks[1].x + cursor_col as u16 + 1,
+                            chunks[1].y + visible_line + 1,
+                        ));
+                    }
+                }
+            }
+            
+            // Help overlay
+            if app.focus == Focus::Help {
+                let help_text = vec![
+                    Line::from(Span::styled("═══ Hank TUI Hilfe ═══", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                    Line::from(""),
+                    Line::from(Span::styled("── Allgemein ──", Style::default().fg(Color::Cyan))),
+                    Line::from("  F1, ?         Hilfe anzeigen/schließen"),
+                    Line::from("  Tab           Fokus wechseln (Input ↔ Chat)"),
+                    Line::from("  Esc, Ctrl+C   Beenden"),
+                    Line::from(""),
+                    Line::from(Span::styled("── Eingabe (Input fokussiert) ──", Style::default().fg(Color::Cyan))),
+                    Line::from("  Ctrl+S        Nachricht senden"),
+                    Line::from("  Ctrl+Enter    Nachricht senden (nicht alle Terminals)"),
+                    Line::from("  Enter         Neue Zeile"),
+                    Line::from("  Ctrl+V        Einfügen aus Zwischenablage"),
+                    Line::from("  ↑/↓           Cursor zwischen Zeilen bewegen"),
+                    Line::from("  ←/→           Cursor links/rechts"),
+                    Line::from("  Home/End      Zeilenanfang/-ende"),
+                    Line::from("  Ctrl+↑/↓      Command History (vorherige Nachrichten)"),
+                    Line::from(""),
+                    Line::from(Span::styled("── Chat (Chat fokussiert) ──", Style::default().fg(Color::Cyan))),
+                    Line::from("  ↑/↓           Scrollen (1 Zeile)"),
+                    Line::from("  PgUp/PgDown   Scrollen (10 Zeilen)"),
+                    Line::from("  Home          Zum Anfang"),
+                    Line::from("  End           Zum Ende (Auto-Scroll)"),
+                    Line::from(""),
+                    Line::from(Span::styled("── Sonstiges ──", Style::default().fg(Color::Cyan))),
+                    Line::from("  Alt+↑/↓       Chat scrollen (immer)"),
+                    Line::from("  Ctrl+L        Chat löschen (nur Anzeige)"),
+                    Line::from("  Ctrl+Shift+D  History-Datei löschen"),
+                    Line::from(""),
+                    Line::from(Span::styled("Drücke eine beliebige Taste zum Schließen", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
+                ];
                 
-                let items: Vec<ListItem> = app.sessions
-                    .iter()
-                    .map(|s| ListItem::new(s.as_str()))
-                    .collect();
+                // Clamp help dimensions to terminal size
+                let term_width = f.area().width;
+                let term_height = f.area().height;
+                let help_height = (help_text.len() as u16 + 2).min(term_height.saturating_sub(2));
+                let help_width = 55u16.min(term_width.saturating_sub(2));
+                let help_x = term_width.saturating_sub(help_width) / 2;
+                let help_y = term_height.saturating_sub(help_height) / 2;
                 
-                let list = List::new(items)
-                    .block(Block::default()
+                // Ensure we don't overflow
+                let help_width = help_width.min(term_width.saturating_sub(help_x));
+                let help_height = help_height.min(term_height.saturating_sub(help_y));
+                
+                if help_width > 2 && help_height > 2 {
+                    let help_area = ratatui::layout::Rect::new(help_x, help_y, help_width, help_height);
+                    
+                    // Clear area behind help
+                    f.render_widget(ratatui::widgets::Clear, help_area);
+                    
+                    let help_block = Block::default()
                         .borders(Borders::ALL)
-                        .title(" Sessions laden (Enter=laden, Esc=abbrechen) "))
-                    .highlight_style(Style::default()
-                        .bg(Color::Blue)
-                        .add_modifier(Modifier::BOLD))
-                    .highlight_symbol("▶ ");
-                
-                f.render_stateful_widget(list, area, &mut app.session_list_state);
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .style(Style::default().bg(Color::Black));
+                    
+                    let help_widget = Paragraph::new(help_text)
+                        .block(help_block)
+                        .wrap(Wrap { trim: false });
+                    f.render_widget(help_widget, help_area);
+                }
             }
         })?;
 
+        // Poll server für neue Nachrichten (alle 2 Sekunden, wenn nicht loading)
+        if !app.loading && app.last_poll.elapsed().as_secs() >= 2 {
+            app.last_poll = Instant::now();
+            let server_url = app.server_url.clone();
+            let since = app.last_timestamp;
+            
+            // Non-blocking poll
+            if let Ok(response) = reqwest::Client::new()
+                .get(format!("{}/messages?since={}", server_url, since))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if let Ok(messages) = response.json::<Vec<ServerMessage>>().await {
+                    for msg in messages {
+                        // Nur hinzufügen wenn noch nicht vorhanden
+                        let already_exists = app.messages.iter().any(|m| {
+                            m.timestamp_ms == Some(msg.timestamp) && m.role == msg.role
+                        });
+                        
+                        if !already_exists {
+                            let timestamp_str = chrono::Local
+                                .timestamp_millis_opt(msg.timestamp as i64)
+                                .single()
+                                .map(|dt| dt.format("%H:%M:%S").to_string())
+                                .unwrap_or_else(|| "??:??:??".to_string());
+                            
+                            app.messages.push(Message {
+                                role: msg.role,
+                                content: msg.content,
+                                timestamp: timestamp_str,
+                                timestamp_ms: Some(msg.timestamp),
+                            });
+                            
+                            if msg.timestamp > app.last_timestamp {
+                                app.last_timestamp = msg.timestamp;
+                            }
+                            
+                            // Auto-scroll bei neuen Nachrichten
+                            if app.auto_scroll {
+                                app.scroll_to_bottom();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                // Windows sendet KeyEventKind::Press UND KeyEventKind::Release
-                // Nur auf Press reagieren, sonst Doppel-Eingaben
+                // Only process key press events, not release events
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 
-                // Session Picker Modus
-                if app.mode == Mode::SessionPicker {
-                    match key.code {
-                        KeyCode::Esc => app.close_session_picker(),
-                        KeyCode::Up => app.session_picker_up(),
-                        KeyCode::Down => app.session_picker_down(),
-                        KeyCode::Enter => {
-                            if let Err(e) = app.load_selected_session() {
-                                app.messages.push(Message {
-                                    role: "system".to_string(),
-                                    content: format!("Fehler beim Laden: {}", e),
-                                });
-                                app.mode = Mode::Normal;
-                            }
-                        }
-                        _ => {}
-                    }
+                // Help screen: any key closes it
+                if app.focus == Focus::Help {
+                    app.toggle_help();
                     continue;
                 }
-
-                // Normal Modus
+                
                 if app.loading {
                     continue;
                 }
                 
+                // Get terminal width for cursor calculations
+                let term_width = terminal.size()?.width.saturating_sub(4) as usize;
+                
                 match key.code {
+                    KeyCode::F(1) => {
+                        app.toggle_help();
+                    }
+                    KeyCode::Char('?') if key.modifiers.is_empty() && app.focus != Focus::Input => {
+                        app.toggle_help();
+                    }
                     KeyCode::Esc => break,
-                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        match app.save_current_session() {
-                            Ok(name) => {
-                                app.messages.push(Message {
-                                    role: "system".to_string(),
-                                    content: format!("Session gespeichert: {}", name),
-                                });
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Clear chat
+                        app.messages.clear();
+                        app.messages.push(Message {
+                            role: "system".to_string(),
+                            content: format!("Chat gelöscht. Verbunden mit {}", app.server_url),
+                            timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                        });
+                        app.last_error = None;
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') 
+                        if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
+                        // Clear history file (Ctrl+Shift+D)
+                        if app.history_enabled {
+                            match ChatHistory::delete() {
+                                Ok(_) => {
+                                    app.messages.clear();
+                                    app.messages.push(Message {
+                                        role: "system".to_string(),
+                                        content: "Chat Historie gelöscht.".to_string(),
+                                        timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                                    });
+                                    app.last_error = None;
+                                }
+                                Err(e) => {
+                                    app.last_error = Some(format!("Fehler beim Löschen: {}", e));
+                                }
                             }
-                            Err(e) => {
-                                app.messages.push(Message {
-                                    role: "system".to_string(),
-                                    content: format!("Fehler beim Speichern: {}", e),
-                                });
+                        } else {
+                            app.last_error = Some("History ist deaktiviert (--no-history)".to_string());
+                        }
+                    }
+                    KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Paste from clipboard (Ctrl+V) - only when input is focused
+                        if app.focus == Focus::Input {
+                            match Clipboard::new() {
+                                Ok(mut clipboard) => {
+                                    match clipboard.get_text() {
+                                        Ok(text) => {
+                                            // Insert at cursor position (convert char pos to byte pos)
+                                            let byte_pos: usize = app.input.chars().take(app.cursor_pos).map(|c| c.len_utf8()).sum();
+                                            app.input.insert_str(byte_pos, &text);
+                                            app.cursor_pos += text.chars().count();
+                                        }
+                                        Err(_) => {
+                                            app.last_error = Some("Clipboard ist leer oder nicht verfügbar".to_string());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    app.last_error = Some(format!("Clipboard-Fehler: {}", e));
+                                }
                             }
                         }
                     }
-                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.open_session_picker();
+                    KeyCode::Tab => {
+                        // Toggle focus between input and chat
+                        app.toggle_focus();
                     }
-                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Neue Session
-                        app.messages.clear();
-                        app.input.clear();
-                        app.cursor_pos = 0;
-                        app.scroll = 0;
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Command history navigation with Ctrl+Up
+                        if app.focus == Focus::Input {
+                            app.navigate_history_up();
+                        }
                     }
-                    KeyCode::Enter => {
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Command history navigation with Ctrl+Down
+                        if app.focus == Focus::Input {
+                            app.navigate_history_down();
+                        }
+                    }
+                    KeyCode::Up if key.modifiers.is_empty() => {
+                        match app.focus {
+                            Focus::Input => app.cursor_up(term_width),
+                            Focus::Chat => app.scroll_up(),
+                            Focus::Help => {}
+                        }
+                    }
+                    KeyCode::Down if key.modifiers.is_empty() => {
+                        match app.focus {
+                            Focus::Input => app.cursor_down(term_width),
+                            Focus::Chat => app.scroll_down(),
+                            Focus::Help => {}
+                        }
+                    }
+                    KeyCode::Left if app.focus == Focus::Input => {
+                        if app.cursor_pos > 0 {
+                            app.cursor_pos -= 1;
+                        }
+                    }
+                    KeyCode::Right if app.focus == Focus::Input => {
+                        if app.cursor_pos < app.input.len() {
+                            app.cursor_pos += 1;
+                        }
+                    }
+                    KeyCode::Home if app.focus == Focus::Input => {
+                        // Move to start of current line
+                        let (line, _) = app.cursor_line_col(term_width);
+                        if line == 0 {
+                            app.cursor_pos = 0;
+                        } else {
+                            // Find start of current line
+                            let mut current_line = 0;
+                            let mut line_start = 0;
+                            let mut col = 0;
+                            
+                            for (i, ch) in app.input.chars().enumerate() {
+                                if current_line == line {
+                                    line_start = i;
+                                    break;
+                                }
+                                if ch == '\n' {
+                                    current_line += 1;
+                                    col = 0;
+                                } else {
+                                    col += 1;
+                                    if col >= term_width {
+                                        current_line += 1;
+                                        col = 0;
+                                    }
+                                }
+                            }
+                            app.cursor_pos = line_start;
+                        }
+                    }
+                    KeyCode::End if app.focus == Focus::Input => {
+                        // Move to end of current line
+                        let (line, _) = app.cursor_line_col(term_width);
+                        let total_lines = app.input_total_lines(term_width);
+                        
+                        if line >= total_lines - 1 {
+                            app.cursor_pos = app.input.len();
+                        } else {
+                            // Find end of current line
+                            let mut current_line = 0;
+                            let mut col = 0;
+                            
+                            for (i, ch) in app.input.chars().enumerate() {
+                                if current_line > line {
+                                    app.cursor_pos = i.saturating_sub(1);
+                                    break;
+                                }
+                                if ch == '\n' {
+                                    if current_line == line {
+                                        app.cursor_pos = i;
+                                        break;
+                                    }
+                                    current_line += 1;
+                                    col = 0;
+                                } else {
+                                    col += 1;
+                                    if col >= term_width {
+                                        if current_line == line {
+                                            app.cursor_pos = i + 1;
+                                            break;
+                                        }
+                                        current_line += 1;
+                                        col = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                        app.scroll_up();
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        app.scroll_down();
+                    }
+                    KeyCode::Home if app.focus == Focus::Chat => {
+                        app.auto_scroll = false;
+                        app.scroll = 10000;
+                    }
+                    KeyCode::End if app.focus == Focus::Chat => {
+                        app.scroll_to_bottom();
+                    }
+                    KeyCode::PageUp => {
+                        app.auto_scroll = false;
+                        app.scroll = app.scroll.saturating_add(10);
+                    }
+                    KeyCode::PageDown => {
+                        if app.scroll > 10 {
+                            app.scroll = app.scroll.saturating_sub(10);
+                        } else {
+                            app.scroll_to_bottom();
+                        }
+                    }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Send message with Ctrl+S (alternative to Ctrl+Enter)
                         if !app.input.trim().is_empty() {
+                            let user_msg = app.input.trim().to_string();
+                            
+                            // Add to command history
+                            app.command_history.push(user_msg.clone());
+                            app.history_index = None;
+                            
+                            // Add user message
                             app.messages.push(Message {
                                 role: "user".to_string(),
-                                content: app.input.clone(),
+                                content: user_msg.clone(),
+                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
                             });
-                            let user_msg = app.input.clone();
                             app.input.clear();
                             app.cursor_pos = 0;
+                            app.input_scroll = 0;
                             app.loading = true;
+                            app.connection_status = "Sending...".to_string();
+                            app.last_error = None;
+                            app.scroll_to_bottom();
                             
+                            // Send request in background
                             let server_url = app.server_url.clone();
                             let handle = tokio::spawn(async move {
                                 let client = reqwest::Client::new();
-                                client
+                                let result = client
                                     .post(format!("{}/chat", server_url))
                                     .json(&ChatRequest { message: user_msg })
                                     .timeout(std::time::Duration::from_secs(120))
                                     .send()
-                                    .await
-                                    .ok()
-                                    .and_then(|r| futures::executor::block_on(r.json::<ChatResponse>()).ok())
+                                    .await;
+                                
+                                match result {
+                                    Ok(response) => {
+                                        match response.json::<ChatResponse>().await {
+                                            Ok(data) => Ok(data.content),
+                                            Err(e) => Err(format!("Failed to parse response: {}", e)),
+                                        }
+                                    }
+                                    Err(e) => Err(format!("Connection error: {}", e)),
+                                }
                             });
                             
+                            // Wait for response with UI updates
                             loop {
                                 terminal.draw(|f| {
                                     let chunks = Layout::default()
                                         .direction(Direction::Vertical)
-                                        .constraints([Constraint::Min(3), Constraint::Length(3)])
+                                        .constraints([Constraint::Min(3), Constraint::Length(3), Constraint::Length(1)])
                                         .split(f.area());
 
                                     let mut lines: Vec<Line> = Vec::new();
@@ -498,15 +1189,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             "system" => ("", Style::default().fg(Color::DarkGray)),
                                             _ => ("", Style::default()),
                                         };
-                                        for (i, line) in msg.content.lines().enumerate() {
-                                            if i == 0 {
-                                                lines.push(Line::from(vec![
-                                                    Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                                                    Span::styled(line, style),
-                                                ]));
-                                            } else {
+                                        
+                                        if !msg.role.is_empty() && msg.role != "system" {
+                                            lines.push(Line::from(vec![
+                                                Span::styled(&msg.timestamp, Style::default().fg(Color::DarkGray)),
+                                                Span::raw(" "),
+                                                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                                                Span::styled(msg.content.lines().next().unwrap_or(""), style),
+                                            ]));
+                                            for line in msg.content.lines().skip(1) {
                                                 lines.push(Line::from(Span::styled(line, style)));
                                             }
+                                        } else {
+                                            lines.push(Line::from(Span::styled(&msg.content, style)));
                                         }
                                         lines.push(Line::from(""));
                                     }
@@ -515,30 +1210,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Style::default().fg(Color::Yellow),
                                     )));
 
+                                    // Auto-scroll to bottom
+                                    let total_lines = lines.len() as u16;
+                                    let visible_lines = chunks[0].height.saturating_sub(2);
+                                    let scroll_offset = total_lines.saturating_sub(visible_lines);
+
                                     let messages = Paragraph::new(lines)
                                         .block(Block::default().borders(Borders::ALL).title(" Chat "))
-                                        .wrap(Wrap { trim: false });
+                                        .wrap(Wrap { trim: false })
+                                        .scroll((scroll_offset, 0));
                                     f.render_widget(messages, chunks[0]);
 
                                     let input = Paragraph::new("")
                                         .block(Block::default().borders(Borders::ALL).title(" Warte... "))
                                         .style(Style::default().fg(Color::DarkGray));
                                     f.render_widget(input, chunks[1]);
+                                    
+                                    let status_text = format!(" {} | Sending request...", app.server_url);
+                                    let status = Paragraph::new(status_text)
+                                        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                                    f.render_widget(status, chunks[2]);
                                 })?;
 
                                 if handle.is_finished() {
                                     match handle.await {
-                                        Ok(Some(resp)) => {
+                                        Ok(Ok(content)) => {
                                             app.messages.push(Message {
                                                 role: "assistant".to_string(),
-                                                content: resp.content,
+                                                content,
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
                                             });
+                                            app.connection_status = "Connected".to_string();
+                                            app.scroll_to_bottom();
                                         }
-                                        _ => {
+                                        Ok(Err(err)) => {
                                             app.messages.push(Message {
-                                                role: "system".to_string(),
-                                                content: "Fehler bei der Anfrage".to_string(),
+                                                role: "error".to_string(),
+                                                content: err.clone(),
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
                                             });
+                                            app.last_error = Some(err);
+                                            app.connection_status = "Error".to_string();
+                                            app.scroll_to_bottom();
+                                        }
+                                        Err(e) => {
+                                            let err_msg = format!("Task failed: {}", e);
+                                            app.messages.push(Message {
+                                                role: "error".to_string(),
+                                                content: err_msg.clone(),
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                                            });
+                                            app.last_error = Some(err_msg);
+                                            app.connection_status = "Error".to_string();
+                                            app.scroll_to_bottom();
                                         }
                                     }
                                     app.loading = false;
@@ -549,24 +1276,190 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char(c) => app.insert_char(c),
-                    KeyCode::Backspace => app.delete_char_before_cursor(),
-                    KeyCode::Delete => app.delete_char_at_cursor(),
-                    KeyCode::Left => app.move_cursor_left(),
-                    KeyCode::Right => app.move_cursor_right(),
-                    KeyCode::Home => app.cursor_pos = 0,
-                    KeyCode::End => app.cursor_pos = app.input.chars().count(),
-                    KeyCode::Up => app.scroll = app.scroll.saturating_add(1),
-                    KeyCode::Down => app.scroll = app.scroll.saturating_sub(1),
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Send message with Ctrl+Enter (may not work in all terminals)
+                        if !app.input.trim().is_empty() {
+                            let user_msg = app.input.trim().to_string();
+                            
+                            // Add to command history
+                            app.command_history.push(user_msg.clone());
+                            app.history_index = None;
+                            
+                            // Add user message
+                            app.messages.push(Message {
+                                role: "user".to_string(),
+                                content: user_msg.clone(),
+                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                            });
+                            app.input.clear();
+                            app.cursor_pos = 0;
+                            app.input_scroll = 0;
+                            app.loading = true;
+                            app.connection_status = "Sending...".to_string();
+                            app.last_error = None;
+                            app.scroll_to_bottom();
+                            
+                            // Send request in background
+                            let server_url = app.server_url.clone();
+                            let handle = tokio::spawn(async move {
+                                let client = reqwest::Client::new();
+                                let result = client
+                                    .post(format!("{}/chat", server_url))
+                                    .json(&ChatRequest { message: user_msg })
+                                    .timeout(std::time::Duration::from_secs(120))
+                                    .send()
+                                    .await;
+                                
+                                match result {
+                                    Ok(response) => {
+                                        match response.json::<ChatResponse>().await {
+                                            Ok(data) => Ok(data.content),
+                                            Err(e) => Err(format!("Failed to parse response: {}", e)),
+                                        }
+                                    }
+                                    Err(e) => Err(format!("Connection error: {}", e)),
+                                }
+                            });
+                            
+                            // Wait for response with UI updates
+                            loop {
+                                terminal.draw(|f| {
+                                    let chunks = Layout::default()
+                                        .direction(Direction::Vertical)
+                                        .constraints([Constraint::Min(3), Constraint::Length(3), Constraint::Length(1)])
+                                        .split(f.area());
+
+                                    let mut lines: Vec<Line> = Vec::new();
+                                    for msg in &app.messages {
+                                        let (prefix, style) = match msg.role.as_str() {
+                                            "user" => ("Du: ", Style::default().fg(Color::Cyan)),
+                                            "assistant" => ("Hank: ", Style::default().fg(Color::Green)),
+                                            "system" => ("", Style::default().fg(Color::DarkGray)),
+                                            _ => ("", Style::default()),
+                                        };
+                                        
+                                        if !msg.role.is_empty() && msg.role != "system" {
+                                            lines.push(Line::from(vec![
+                                                Span::styled(&msg.timestamp, Style::default().fg(Color::DarkGray)),
+                                                Span::raw(" "),
+                                                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                                                Span::styled(msg.content.lines().next().unwrap_or(""), style),
+                                            ]));
+                                            for line in msg.content.lines().skip(1) {
+                                                lines.push(Line::from(Span::styled(line, style)));
+                                            }
+                                        } else {
+                                            lines.push(Line::from(Span::styled(&msg.content, style)));
+                                        }
+                                        lines.push(Line::from(""));
+                                    }
+                                    lines.push(Line::from(Span::styled(
+                                        "Hank denkt nach...",
+                                        Style::default().fg(Color::Yellow),
+                                    )));
+
+                                    // Auto-scroll to bottom
+                                    let total_lines = lines.len() as u16;
+                                    let visible_lines = chunks[0].height.saturating_sub(2);
+                                    let scroll_offset = total_lines.saturating_sub(visible_lines);
+
+                                    let messages = Paragraph::new(lines)
+                                        .block(Block::default().borders(Borders::ALL).title(" Chat "))
+                                        .wrap(Wrap { trim: false })
+                                        .scroll((scroll_offset, 0));
+                                    f.render_widget(messages, chunks[0]);
+
+                                    let input = Paragraph::new("")
+                                        .block(Block::default().borders(Borders::ALL).title(" Warte... "))
+                                        .style(Style::default().fg(Color::DarkGray));
+                                    f.render_widget(input, chunks[1]);
+                                    
+                                    let status_text = format!(" {} | Sending request...", app.server_url);
+                                    let status = Paragraph::new(status_text)
+                                        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                                    f.render_widget(status, chunks[2]);
+                                })?;
+
+                                if handle.is_finished() {
+                                    match handle.await {
+                                        Ok(Ok(content)) => {
+                                            app.messages.push(Message {
+                                                role: "assistant".to_string(),
+                                                content,
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                                            });
+                                            app.connection_status = "Connected".to_string();
+                                            app.scroll_to_bottom();
+                                        }
+                                        Ok(Err(err)) => {
+                                            app.messages.push(Message {
+                                                role: "error".to_string(),
+                                                content: err.clone(),
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                                            });
+                                            app.last_error = Some(err);
+                                            app.connection_status = "Error".to_string();
+                                            app.scroll_to_bottom();
+                                        }
+                                        Err(e) => {
+                                            let err_msg = format!("Task failed: {}", e);
+                                            app.messages.push(Message {
+                                                role: "error".to_string(),
+                                                content: err_msg.clone(),
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                        timestamp_ms: Some(now_ms()),
+                                            });
+                                            app.last_error = Some(err_msg);
+                                            app.connection_status = "Error".to_string();
+                                            app.scroll_to_bottom();
+                                        }
+                                    }
+                                    app.loading = false;
+                                    break;
+                                }
+
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                    KeyCode::Enter if app.focus == Focus::Input => {
+                        // Insert newline with Enter key
+                        let byte_pos: usize = app.input.chars().take(app.cursor_pos).map(|c| c.len_utf8()).sum();
+                        app.input.insert(byte_pos, '\n');
+                        app.cursor_pos += 1;
+                        app.history_index = None;
+                    }
+                    KeyCode::Char(c) if app.focus == Focus::Input => {
+                        let byte_pos: usize = app.input.chars().take(app.cursor_pos).map(|c| c.len_utf8()).sum();
+                        app.input.insert(byte_pos, c);
+                        app.cursor_pos += 1;
+                        app.history_index = None;
+                    }
+                    KeyCode::Backspace if app.focus == Focus::Input => {
+                        if app.cursor_pos > 0 {
+                            app.cursor_pos -= 1;
+                            let byte_pos: usize = app.input.chars().take(app.cursor_pos).map(|c| c.len_utf8()).sum();
+                            let char_len = app.input.chars().nth(app.cursor_pos).map(|c| c.len_utf8()).unwrap_or(1);
+                            app.input.drain(byte_pos..byte_pos + char_len);
+                            app.history_index = None;
+                        }
+                    }
+                    KeyCode::Delete if app.focus == Focus::Input => {
+                        if app.cursor_pos < app.input.chars().count() {
+                            let byte_pos: usize = app.input.chars().take(app.cursor_pos).map(|c| c.len_utf8()).sum();
+                            let char_len = app.input.chars().nth(app.cursor_pos).map(|c| c.len_utf8()).unwrap_or(1);
+                            app.input.drain(byte_pos..byte_pos + char_len);
+                            app.history_index = None;
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     
     Ok(())
 }
