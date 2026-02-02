@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyModifiers, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -400,6 +400,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // Windows sendet KeyEventKind::Press UND KeyEventKind::Release
+                // Nur auf Press reagieren, sonst Doppel-Eingaben
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                
                 // Session Picker Modus
                 if app.mode == Mode::SessionPicker {
                     match key.code {
