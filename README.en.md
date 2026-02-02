@@ -24,7 +24,7 @@ This is the result.
 - 📋 **Clipboard** – Ctrl+V to paste
 - 🔀 **Tab Focus** – Switch between chat and input
 - 🎯 **Correct Unicode Width** – Even emojis wrap correctly
-- 💾 **Session Saving** – Ctrl+S saves, Ctrl+O loads
+- 💾 **Automatic History** – Chat is saved on exit
 - ❓ **F1 Help** – All hotkeys at a glance
 
 ## Installation
@@ -62,9 +62,8 @@ port = 8080
 
 | Key | Action |
 |-----|--------|
-| `Enter` | New line |
-| `Ctrl+S` | Send message |
-| `Ctrl+Enter` | Send message (if terminal supports it) |
+| `Enter` | Send message |
+| `Shift+Enter` | New line |
 | `Tab` | Switch focus (Input ↔ Chat) |
 | `↑/↓` | Move cursor in lines |
 | `Ctrl+↑/↓` | Command history |

@@ -24,7 +24,7 @@ Das hier ist das Ergebnis.
 - 📋 **Clipboard** – Ctrl+V zum Einfügen
 - 🔀 **Tab-Fokus** – Zwischen Chat und Input wechseln
 - 🎯 **Korrekte Unicode-Breite** – Auch Emojis brechen richtig um
-- 💾 **Session-Speicherung** – Ctrl+S speichert, Ctrl+O lädt
+- 💾 **Automatische History** – Chat wird beim Beenden gespeichert
 - ❓ **F1 Hilfe** – Alle Hotkeys auf einen Blick
 
 ## Installation
@@ -62,9 +62,8 @@ port = 8080
 
 | Taste | Aktion |
 |-------|--------|
-| `Enter` | Neue Zeile |
-| `Ctrl+S` | Nachricht senden |
-| `Ctrl+Enter` | Nachricht senden (falls Terminal unterstützt) |
+| `Enter` | Nachricht senden |
+| `Shift+Enter` | Neue Zeile |
 | `Tab` | Fokus wechseln (Input ↔ Chat) |
 | `↑/↓` | Cursor in Zeilen bewegen |
 | `Ctrl+↑/↓` | Command History |

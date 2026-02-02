@@ -730,7 +730,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             let input_title = if app.loading {
                 " Warte... "
             } else if app.focus == Focus::Input {
-                " Nachricht [Ctrl+S=Senden, F1=Hilfe] "
+                " Nachricht [Enter=Senden, Shift+Enter=Neue Zeile, F1=Hilfe] "
             } else {
                 " Nachricht [Tab=Fokussieren] "
             };
@@ -807,9 +807,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     Line::from("  Esc, Ctrl+C   Beenden"),
                     Line::from(""),
                     Line::from(Span::styled("── Eingabe (Input fokussiert) ──", Style::default().fg(Color::Cyan))),
-                    Line::from("  Ctrl+S        Nachricht senden"),
-                    Line::from("  Ctrl+Enter    Nachricht senden (nicht alle Terminals)"),
-                    Line::from("  Enter         Neue Zeile"),
+                    Line::from("  Enter         Nachricht senden"),
+                    Line::from("  Shift+Enter   Neue Zeile"),
                     Line::from("  Ctrl+V        Einfügen aus Zwischenablage"),
                     Line::from("  ↑/↓           Cursor zwischen Zeilen bewegen"),
                     Line::from("  ←/→           Cursor links/rechts"),
@@ -1425,12 +1424,161 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                     }
-                    KeyCode::Enter if app.focus == Focus::Input => {
-                        // Insert newline with Enter key
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) && app.focus == Focus::Input => {
+                        // Insert newline with Shift+Enter
                         let byte_pos: usize = app.input.chars().take(app.cursor_pos).map(|c| c.len_utf8()).sum();
                         app.input.insert(byte_pos, '\n');
                         app.cursor_pos += 1;
                         app.history_index = None;
+                    }
+                    KeyCode::Enter if app.focus == Focus::Input => {
+                        // Send message with Enter
+                        if !app.input.trim().is_empty() {
+                            let user_msg = app.input.trim().to_string();
+                            
+                            // Add to command history
+                            app.command_history.push(user_msg.clone());
+                            app.history_index = None;
+                            
+                            // Add user message
+                            app.messages.push(Message {
+                                role: "user".to_string(),
+                                content: user_msg.clone(),
+                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                                timestamp_ms: Some(now_ms()),
+                            });
+                            app.input.clear();
+                            app.cursor_pos = 0;
+                            app.input_scroll = 0;
+                            app.loading = true;
+                            app.connection_status = "Sending...".to_string();
+                            app.last_error = None;
+                            app.scroll_to_bottom();
+                            
+                            // Send request in background
+                            let server_url = app.server_url.clone();
+                            let handle = tokio::spawn(async move {
+                                let client = reqwest::Client::new();
+                                let result = client
+                                    .post(format!("{}/chat", server_url))
+                                    .json(&ChatRequest { message: user_msg })
+                                    .timeout(std::time::Duration::from_secs(120))
+                                    .send()
+                                    .await;
+                                
+                                match result {
+                                    Ok(response) => {
+                                        match response.json::<ChatResponse>().await {
+                                            Ok(data) => Ok(data.content),
+                                            Err(e) => Err(format!("Failed to parse response: {}", e)),
+                                        }
+                                    }
+                                    Err(e) => Err(format!("Connection error: {}", e)),
+                                }
+                            });
+                            
+                            // Wait for response with UI updates
+                            loop {
+                                terminal.draw(|f| {
+                                    let chunks = Layout::default()
+                                        .direction(Direction::Vertical)
+                                        .constraints([Constraint::Min(3), Constraint::Length(3), Constraint::Length(1)])
+                                        .split(f.area());
+
+                                    let mut lines: Vec<Line> = Vec::new();
+                                    for msg in &app.messages {
+                                        let (prefix, style) = match msg.role.as_str() {
+                                            "user" => ("Du: ", Style::default().fg(Color::Cyan)),
+                                            "assistant" => ("Hank: ", Style::default().fg(Color::Green)),
+                                            "system" => ("", Style::default().fg(Color::DarkGray)),
+                                            _ => ("", Style::default()),
+                                        };
+                                        
+                                        if !msg.role.is_empty() && msg.role != "system" {
+                                            lines.push(Line::from(vec![
+                                                Span::styled(&msg.timestamp, Style::default().fg(Color::DarkGray)),
+                                                Span::raw(" "),
+                                                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                                                Span::styled(msg.content.lines().next().unwrap_or(""), style),
+                                            ]));
+                                            for line in msg.content.lines().skip(1) {
+                                                lines.push(Line::from(Span::styled(line, style)));
+                                            }
+                                        } else {
+                                            lines.push(Line::from(Span::styled(&msg.content, style)));
+                                        }
+                                        lines.push(Line::from(""));
+                                    }
+                                    lines.push(Line::from(Span::styled(
+                                        "Hank denkt nach...",
+                                        Style::default().fg(Color::Yellow),
+                                    )));
+
+                                    // Auto-scroll to bottom
+                                    let total_lines = lines.len() as u16;
+                                    let visible_lines = chunks[0].height.saturating_sub(2);
+                                    let scroll_offset = total_lines.saturating_sub(visible_lines);
+
+                                    let messages = Paragraph::new(lines)
+                                        .block(Block::default().borders(Borders::ALL).title(" Chat "))
+                                        .wrap(Wrap { trim: false })
+                                        .scroll((scroll_offset, 0));
+                                    f.render_widget(messages, chunks[0]);
+
+                                    let input = Paragraph::new("")
+                                        .block(Block::default().borders(Borders::ALL).title(" Warte... "))
+                                        .style(Style::default().fg(Color::DarkGray));
+                                    f.render_widget(input, chunks[1]);
+                                    
+                                    let status_text = format!(" {} | Sending request...", app.server_url);
+                                    let status = Paragraph::new(status_text)
+                                        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                                    f.render_widget(status, chunks[2]);
+                                })?;
+
+                                if handle.is_finished() {
+                                    match handle.await {
+                                        Ok(Ok(content)) => {
+                                            app.messages.push(Message {
+                                                role: "assistant".to_string(),
+                                                content,
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                                                timestamp_ms: Some(now_ms()),
+                                            });
+                                            app.connection_status = "Connected".to_string();
+                                            app.scroll_to_bottom();
+                                        }
+                                        Ok(Err(err)) => {
+                                            app.messages.push(Message {
+                                                role: "error".to_string(),
+                                                content: err.clone(),
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                                                timestamp_ms: Some(now_ms()),
+                                            });
+                                            app.last_error = Some(err);
+                                            app.connection_status = "Error".to_string();
+                                            app.scroll_to_bottom();
+                                        }
+                                        Err(e) => {
+                                            let err_msg = format!("Task failed: {}", e);
+                                            app.messages.push(Message {
+                                                role: "error".to_string(),
+                                                content: err_msg.clone(),
+                                                timestamp: Local::now().format("%H:%M:%S").to_string(),
+                                                timestamp_ms: Some(now_ms()),
+                                            });
+                                            app.last_error = Some(err_msg);
+                                            app.connection_status = "Error".to_string();
+                                            app.scroll_to_bottom();
+                                        }
+                                    }
+                                    app.loading = false;
+                                    break;
+                                }
+
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        }
                     }
                     KeyCode::Char(c) if app.focus == Focus::Input => {
                         let byte_pos: usize = app.input.chars().take(app.cursor_pos).map(|c| c.len_utf8()).sum();
