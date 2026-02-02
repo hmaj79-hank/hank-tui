@@ -4,7 +4,7 @@
 
 Once upon a time, there was a seasoned developer named Glan. Back in the early 90s, when the sun still shone over Sun Microsystems, he was hacking ONC RPC on SunOS and Solaris. The world's first MALDI-TOFs were sending their display vectors via UDP to Sun workstations – and Glan was there. OS/9 as the data sender, the workstation as the receiver, pure magic in a time when "Cloud" was still something you saw in the sky.
 
-Decades later: Glan is still coding. Rust and C++ at the office, a Labrador named Bobby at home, and a small problem: All those AI chat interfaces are just too... clunky. Open browser, open tab, type, wait. There has to be a better way.
+Decades later: Glan is still coding. Java for years, now back to C++ at the office, with Rust for support. A Labrador named Bobby at home, and a small problem: All those AI chat interfaces are just too... clunky. Open browser, open tab, type, wait. There has to be a better way.
 
 Then came Hank.
 

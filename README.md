@@ -4,7 +4,7 @@
 
 Es war einmal ein alter Hase namens Glan. Schon in den frühen 90ern, als die Sonne noch über Sun Microsystems schien, hackte er ONC RPC unter SunOS und Solaris. Die ersten MALDI-TOFs der Welt sendeten ihre Display-Vektoren per UDP an die Sun-Workstations – und Glan war dabei. OS/9 als Datensender, die Workstation als Empfänger, pure Magie in einer Zeit, als "Cloud" noch etwas war, das man am Himmel sah.
 
-Jahrzehnte später: Glan ist immer noch am Coden. Rust und C++ im Büro, ein Labrador namens Bobby zu Hause, und ein kleines Problem: Die ganzen AI-Chat-Interfaces sind ihm zu... klobig. Browser auf, Tab auf, tippen, warten. Das kann doch besser gehen.
+Jahrzehnte später: Glan ist immer noch am Coden. Lange Java, jetzt wieder C++ im Büro, mit Rust zur Unterstützung. Ein Labrador namens Bobby zu Hause, und ein kleines Problem: Die ganzen AI-Chat-Interfaces sind ihm zu... klobig. Browser auf, Tab auf, tippen, warten. Das kann doch besser gehen.
 
 Dann kam Hank.
 
