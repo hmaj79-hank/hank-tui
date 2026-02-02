@@ -16,6 +16,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, io, panic, path::PathBuf, time::Instant};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Parser, Debug)]
 #[command(name = "hank-tui")]
@@ -345,10 +346,13 @@ impl App {
                 line += 1;
                 col = 0;
             } else {
-                col += 1;
-                if col >= width {
+                let char_width = ch.width().unwrap_or(1);
+                // Check if this character would overflow the line
+                if col + char_width > width {
                     line += 1;
-                    col = 0;
+                    col = char_width;
+                } else {
+                    col += char_width;
                 }
             }
         }
@@ -370,10 +374,12 @@ impl App {
                 lines += 1;
                 col = 0;
             } else {
-                col += 1;
-                if col >= width {
+                let char_width = ch.width().unwrap_or(1);
+                if col + char_width > width {
                     lines += 1;
-                    col = 0;
+                    col = char_width;
+                } else {
+                    col += char_width;
                 }
             }
         }
@@ -400,7 +406,7 @@ impl App {
         let mut target_pos = 0;
         
         for (i, ch) in self.input.chars().enumerate() {
-            if current_line == target_line && current_col == col {
+            if current_line == target_line && current_col >= col {
                 target_pos = i;
                 break;
             }
@@ -419,18 +425,20 @@ impl App {
                 current_line += 1;
                 current_col = 0;
             } else {
+                let char_width = ch.width().unwrap_or(1);
                 if current_line == target_line {
                     target_pos = i;
                 }
-                current_col += 1;
-                if current_col >= width {
+                if current_col + char_width > width {
                     if current_line == target_line {
                         // Reached column in wrapped line
-                        target_pos = i + 1;
+                        target_pos = i;
                         break;
                     }
                     current_line += 1;
-                    current_col = 0;
+                    current_col = char_width;
+                } else {
+                    current_col += char_width;
                 }
             }
         }
@@ -472,10 +480,12 @@ impl App {
                 current_line += 1;
                 current_col = 0;
             } else {
-                current_col += 1;
-                if current_col >= width {
+                let char_width = ch.width().unwrap_or(1);
+                if current_col + char_width > width {
                     current_line += 1;
-                    current_col = 0;
+                    current_col = char_width;
+                } else {
+                    current_col += char_width;
                 }
             }
         }
