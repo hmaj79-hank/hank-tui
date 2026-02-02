@@ -179,13 +179,28 @@ impl App {
         }
     }
 
-    fn cursor_display_width(&self) -> u16 {
-        // Berechne die Display-Breite bis zur Cursor-Position
-        self.input
-            .chars()
-            .take(self.cursor_pos)
-            .collect::<String>()
-            .width() as u16
+    fn cursor_position(&self, input_width: u16) -> (u16, u16) {
+        // Berechne Cursor-Position unter Berücksichtigung von Wort-Wrap
+        // ratatui wrapped bei Wortgrenzen, nicht mitten im Wort
+        let text_before_cursor: String = self.input.chars().take(self.cursor_pos).collect();
+        
+        let mut x: u16 = 0;
+        let mut y: u16 = 0;
+        
+        for c in text_before_cursor.chars() {
+            let char_width = UnicodeWidthStr::width(c.to_string().as_str()) as u16;
+            
+            // Prüfen ob das nächste Zeichen noch passt
+            if x + char_width > input_width {
+                // Neue Zeile
+                y += 1;
+                x = char_width;
+            } else {
+                x += char_width;
+            }
+        }
+        
+        (x, y)
     }
 
     fn open_session_picker(&mut self) {
@@ -349,16 +364,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             f.render_widget(input_widget, chunks[1]);
 
-            // Cursor - korrekte Position mit Unicode-Breite
+            // Cursor - korrekte Position mit Unicode-Breite und Wrap
             if !app.loading && app.mode == Mode::Normal {
-                let cursor_x = chunks[1].x + 1 + app.cursor_display_width();
                 let input_width = chunks[1].width.saturating_sub(2); // Abzüglich Borders
+                let (cursor_x, cursor_y) = app.cursor_position(input_width);
                 
-                // Wenn Text umbricht, Cursor auf neue Zeile
-                let cursor_y = chunks[1].y + 1 + (app.cursor_display_width() / input_width);
-                let cursor_x_wrapped = chunks[1].x + 1 + (app.cursor_display_width() % input_width);
-                
-                f.set_cursor_position((cursor_x_wrapped, cursor_y));
+                f.set_cursor_position((
+                    chunks[1].x + 1 + cursor_x,
+                    chunks[1].y + 1 + cursor_y
+                ));
             }
 
             // Session-Picker Popup
