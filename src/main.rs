@@ -349,12 +349,12 @@ impl App {
                 col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                col += char_width;
-                // Wrap after character if we reached or exceeded width
-                while col >= width {
+                // Wrap BEFORE adding character if it would exceed width
+                if col + char_width > width {
                     line += 1;
-                    col = col.saturating_sub(width);
+                    col = 0;
                 }
+                col += char_width;
             }
         }
         
@@ -377,11 +377,12 @@ impl App {
                 col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                col += char_width;
-                if col >= width {
+                // Wrap BEFORE adding character if it would exceed width
+                if col + char_width > width {
                     lines += 1;
-                    col = col.saturating_sub(width);
+                    col = 0;
                 }
+                col += char_width;
             }
         }
         
@@ -404,22 +405,19 @@ impl App {
         let target_line = line - 1;
         let mut current_line = 0;
         let mut current_col = 0;
-        let mut target_pos = 0;
         let mut last_pos_on_target_line = 0;
         
         for (i, ch) in self.input.chars().enumerate() {
             if current_line == target_line {
                 last_pos_on_target_line = i;
                 if current_col >= target_col {
-                    target_pos = i;
-                    self.cursor_pos = target_pos;
+                    self.cursor_pos = i;
                     return;
                 }
             }
             if current_line > target_line {
                 // Went past target line
-                target_pos = last_pos_on_target_line;
-                self.cursor_pos = target_pos;
+                self.cursor_pos = last_pos_on_target_line;
                 return;
             }
             
@@ -433,16 +431,17 @@ impl App {
                 current_col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                current_col += char_width;
-                if current_col >= width {
+                // Wrap BEFORE if would exceed
+                if current_col + char_width > width {
                     if current_line == target_line {
                         // End of target line (wrapped)
-                        self.cursor_pos = i + 1;
+                        self.cursor_pos = i;
                         return;
                     }
                     current_line += 1;
-                    current_col = current_col.saturating_sub(width);
+                    current_col = 0;
                 }
+                current_col += char_width;
             }
         }
         
@@ -487,16 +486,17 @@ impl App {
                 current_col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                current_col += char_width;
-                if current_col >= width {
+                // Wrap BEFORE if would exceed
+                if current_col + char_width > width {
                     if current_line == target_line {
                         // End of target line (wrapped)
-                        self.cursor_pos = i + 1;
+                        self.cursor_pos = i;
                         return;
                     }
                     current_line += 1;
-                    current_col = current_col.saturating_sub(width);
+                    current_col = 0;
                 }
+                current_col += char_width;
             }
         }
         
@@ -539,12 +539,13 @@ impl App {
                 col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                col += char_width;
-                if col >= width {
+                // Wrap BEFORE adding character if it would exceed width
+                if col + char_width > width {
                     result.push('\n');
-                    col = char_width;
+                    col = 0;
                 }
                 result.push(ch);
+                col += char_width;
             }
         }
         
