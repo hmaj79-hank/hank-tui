@@ -339,24 +339,26 @@ impl App {
         let mut col = 0;
         
         for (i, ch) in self.input.chars().enumerate() {
+            // Return position BEFORE processing this character
             if i == self.cursor_pos {
-                break;
+                return (line, col);
             }
+            
             if ch == '\n' {
                 line += 1;
                 col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                // Check if this character would overflow the line
-                if col + char_width > width {
+                col += char_width;
+                // Wrap after character if we reached or exceeded width
+                while col >= width {
                     line += 1;
-                    col = char_width;
-                } else {
-                    col += char_width;
+                    col = col.saturating_sub(width);
                 }
             }
         }
         
+        // Cursor is at the end of input
         (line, col)
     }
     
@@ -375,11 +377,10 @@ impl App {
                 col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                if col + char_width > width {
+                col += char_width;
+                if col >= width {
                     lines += 1;
-                    col = char_width;
-                } else {
-                    col += char_width;
+                    col = col.saturating_sub(width);
                 }
             }
         }
@@ -393,7 +394,7 @@ impl App {
             return;
         }
         
-        let (line, col) = self.cursor_line_col(width);
+        let (line, target_col) = self.cursor_line_col(width);
         
         if line == 0 {
             return; // Already at first line
@@ -404,46 +405,48 @@ impl App {
         let mut current_line = 0;
         let mut current_col = 0;
         let mut target_pos = 0;
+        let mut last_pos_on_target_line = 0;
         
         for (i, ch) in self.input.chars().enumerate() {
-            if current_line == target_line && current_col >= col {
-                target_pos = i;
-                break;
+            if current_line == target_line {
+                last_pos_on_target_line = i;
+                if current_col >= target_col {
+                    target_pos = i;
+                    self.cursor_pos = target_pos;
+                    return;
+                }
             }
             if current_line > target_line {
-                // Went past target line, use last position
-                target_pos = i.saturating_sub(1);
-                break;
+                // Went past target line
+                target_pos = last_pos_on_target_line;
+                self.cursor_pos = target_pos;
+                return;
             }
             
             if ch == '\n' {
                 if current_line == target_line {
                     // End of target line before reaching column
-                    target_pos = i;
-                    break;
+                    self.cursor_pos = i;
+                    return;
                 }
                 current_line += 1;
                 current_col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                if current_line == target_line {
-                    target_pos = i;
-                }
-                if current_col + char_width > width {
+                current_col += char_width;
+                if current_col >= width {
                     if current_line == target_line {
-                        // Reached column in wrapped line
-                        target_pos = i;
-                        break;
+                        // End of target line (wrapped)
+                        self.cursor_pos = i + 1;
+                        return;
                     }
                     current_line += 1;
-                    current_col = char_width;
-                } else {
-                    current_col += char_width;
+                    current_col = current_col.saturating_sub(width);
                 }
             }
         }
         
-        self.cursor_pos = target_pos.min(self.input.len());
+        self.cursor_pos = last_pos_on_target_line.min(self.input.len());
     }
     
     /// Move cursor down one line in input
@@ -452,7 +455,7 @@ impl App {
             return;
         }
         
-        let (line, col) = self.cursor_line_col(width);
+        let (line, target_col) = self.cursor_line_col(width);
         let total_lines = self.input_total_lines(width);
         
         if line >= total_lines - 1 {
@@ -463,34 +466,42 @@ impl App {
         let target_line = line + 1;
         let mut current_line = 0;
         let mut current_col = 0;
-        let mut target_pos = self.input.len();
+        let mut last_pos_on_target_line = self.input.len();
         
         for (i, ch) in self.input.chars().enumerate() {
-            if current_line == target_line && current_col >= col {
-                target_pos = i;
-                break;
+            if current_line == target_line {
+                last_pos_on_target_line = i;
+                if current_col >= target_col {
+                    self.cursor_pos = i;
+                    return;
+                }
             }
             
             if ch == '\n' {
                 if current_line == target_line {
                     // End of target line before reaching column
-                    target_pos = i;
-                    break;
+                    self.cursor_pos = i;
+                    return;
                 }
                 current_line += 1;
                 current_col = 0;
             } else {
                 let char_width = ch.width().unwrap_or(1);
-                if current_col + char_width > width {
+                current_col += char_width;
+                if current_col >= width {
+                    if current_line == target_line {
+                        // End of target line (wrapped)
+                        self.cursor_pos = i + 1;
+                        return;
+                    }
                     current_line += 1;
-                    current_col = char_width;
-                } else {
-                    current_col += char_width;
+                    current_col = current_col.saturating_sub(width);
                 }
             }
         }
         
-        self.cursor_pos = target_pos.min(self.input.len());
+        // Cursor ends up at end of input if target line is last
+        self.cursor_pos = self.input.len();
     }
     
     /// Update input scroll to keep cursor visible
