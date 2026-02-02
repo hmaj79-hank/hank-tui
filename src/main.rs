@@ -522,6 +522,34 @@ impl App {
             self.input_scroll = cursor_line - visible_lines + 1;
         }
     }
+    
+    /// Wrap text manually using character-wrapping (not word-wrapping)
+    /// This ensures cursor calculation matches display exactly
+    fn wrap_text_for_display(&self, width: usize) -> String {
+        if width == 0 {
+            return self.input.clone();
+        }
+        
+        let mut result = String::with_capacity(self.input.len() + self.input.len() / width);
+        let mut col = 0;
+        
+        for ch in self.input.chars() {
+            if ch == '\n' {
+                result.push(ch);
+                col = 0;
+            } else {
+                let char_width = ch.width().unwrap_or(1);
+                col += char_width;
+                if col >= width {
+                    result.push('\n');
+                    col = char_width;
+                }
+                result.push(ch);
+            }
+        }
+        
+        result
+    }
 }
 
 fn now_ms() -> u64 {
@@ -722,9 +750,10 @@ async fn run_app<B: ratatui::backend::Backend>(
             // Update scroll to keep cursor visible
             app.update_input_scroll(input_area_width, visible_input_lines);
             
-            let input_widget = Paragraph::new(app.input.as_str())
+            // Use manually wrapped text to ensure cursor matches display
+            let wrapped_input = app.wrap_text_for_display(input_area_width);
+            let input_widget = Paragraph::new(wrapped_input)
                 .block(input_block)
-                .wrap(Wrap { trim: false })
                 .scroll((app.input_scroll, 0))
                 .style(if app.loading {
                     Style::default().fg(Color::DarkGray)
