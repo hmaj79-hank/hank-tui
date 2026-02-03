@@ -819,6 +819,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                 total_lines = lines.len() as u16;
             }
             
+            // Add safety margin for any edge cases
+            total_lines = total_lines.saturating_add(5);
+            
             let visible_lines = chunks[0].height.saturating_sub(2);
             let max_scroll = total_lines.saturating_sub(visible_lines);
             
@@ -892,16 +895,13 @@ async fn run_app<B: ratatui::backend::Backend>(
             f.render_widget(input_widget, chunks[1]);
 
             // Status bar
-            let scroll_info = if app.focus == Focus::Chat && !app.auto_scroll {
-                format!(" Scroll: {} |", app.scroll)
-            } else {
-                String::new()
-            };
             let status_text = format!(
-                " {} |{} History: {} | {}",
+                " {} | Msgs: {} | Lines: {}/{} | Scroll: {} | {}",
                 app.server_url,
-                scroll_info,
-                app.command_history.len(),
+                app.messages.len(),
+                total_lines,
+                visible_lines,
+                scroll_offset,
                 app.connection_status
             );
             let status_widget = Paragraph::new(status_text)
