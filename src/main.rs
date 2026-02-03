@@ -749,13 +749,15 @@ async fn run_app<B: ratatui::backend::Backend>(
             // Estimate total lines including wrapping
             let mut total_lines: u16 = 0;
             for line in &lines {
-                let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+                let line_len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
                 if chat_width > 0 && line_len > chat_width {
                     total_lines += ((line_len + chat_width - 1) / chat_width) as u16;
                 } else {
                     total_lines += 1;
                 }
             }
+            // Add extra lines for safety margin (markdown formatting, etc.)
+            total_lines = total_lines.saturating_add(3);
             
             let visible_lines = chunks[0].height.saturating_sub(2);
             let max_scroll = total_lines.saturating_sub(visible_lines);
