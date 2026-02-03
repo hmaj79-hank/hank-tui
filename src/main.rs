@@ -765,6 +765,10 @@ async fn run_app<B: ratatui::backend::Backend>(
             let scroll_offset = if app.auto_scroll {
                 max_scroll
             } else {
+                // Clamp scroll to valid range and update app.scroll
+                if app.scroll > max_scroll {
+                    app.scroll = max_scroll;
+                }
                 max_scroll.saturating_sub(app.scroll)
             };
 
@@ -1128,7 +1132,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                     KeyCode::Home if app.focus == Focus::Chat => {
                         app.auto_scroll = false;
-                        app.scroll = 10000;
+                        app.scroll = u16::MAX; // Will be clamped during render
                     }
                     KeyCode::End if app.focus == Focus::Chat => {
                         app.scroll_to_bottom();
