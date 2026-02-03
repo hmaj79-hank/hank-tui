@@ -631,8 +631,54 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Initial load: fetch ALL messages from server (since=0)
+    {
+        let server_url = app.server_url.clone();
+        if let Ok(response) = reqwest::Client::new()
+            .get(format!("{}/messages?since=0", server_url))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            if let Ok(messages) = response.json::<Vec<ServerMessage>>().await {
+                // Clear local history and load from server
+                let had_local = !app.messages.is_empty();
+                app.messages.clear();
+                
+                for msg in messages {
+                    let timestamp_str = chrono::Local
+                        .timestamp_millis_opt(msg.timestamp as i64)
+                        .single()
+                        .map(|dt| dt.format("%H:%M:%S").to_string())
+                        .unwrap_or_else(|| "??:??:??".to_string());
+                    
+                    app.messages.push(Message {
+                        role: msg.role,
+                        content: msg.content,
+                        timestamp: timestamp_str,
+                        timestamp_ms: Some(msg.timestamp),
+                    });
+                    
+                    if msg.timestamp > app.last_timestamp {
+                        app.last_timestamp = msg.timestamp;
+                    }
+                }
+                
+                let source = if had_local { "Server (ersetzt lokale Historie)" } else { "Server" };
+                app.messages.push(Message {
+                    role: "system".to_string(),
+                    content: format!("{} Nachrichten vom {} geladen", app.messages.len() - 1, source),
+                    timestamp: Local::now().format("%H:%M:%S").to_string(),
+                    timestamp_ms: Some(now_ms()),
+                });
+                
+                app.scroll_to_bottom();
+            }
+        }
+    }
+    
     loop {
-        // Poll server für neue Nachrichten ZUERST (alle 2 Sekunden, wenn nicht loading)
+        // Poll server für neue Nachrichten (alle 2 Sekunden, wenn nicht loading)
         if !app.loading && app.last_poll.elapsed().as_secs() >= 2 {
             app.last_poll = Instant::now();
             let server_url = app.server_url.clone();
