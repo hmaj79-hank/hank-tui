@@ -632,6 +632,54 @@ async fn run_app<B: ratatui::backend::Backend>(
     app: &mut App,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
+        // Poll server für neue Nachrichten ZUERST (alle 2 Sekunden, wenn nicht loading)
+        if !app.loading && app.last_poll.elapsed().as_secs() >= 2 {
+            app.last_poll = Instant::now();
+            let server_url = app.server_url.clone();
+            let since = app.last_timestamp;
+            
+            // Non-blocking poll
+            if let Ok(response) = reqwest::Client::new()
+                .get(format!("{}/messages?since={}", server_url, since))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if let Ok(messages) = response.json::<Vec<ServerMessage>>().await {
+                    for msg in messages {
+                        // Nur hinzufügen wenn noch nicht vorhanden
+                        let already_exists = app.messages.iter().any(|m| {
+                            m.timestamp_ms == Some(msg.timestamp) && m.role == msg.role
+                        });
+                        
+                        if !already_exists {
+                            let timestamp_str = chrono::Local
+                                .timestamp_millis_opt(msg.timestamp as i64)
+                                .single()
+                                .map(|dt| dt.format("%H:%M:%S").to_string())
+                                .unwrap_or_else(|| "??:??:??".to_string());
+                            
+                            app.messages.push(Message {
+                                role: msg.role,
+                                content: msg.content,
+                                timestamp: timestamp_str,
+                                timestamp_ms: Some(msg.timestamp),
+                            });
+                            
+                            if msg.timestamp > app.last_timestamp {
+                                app.last_timestamp = msg.timestamp;
+                            }
+                            
+                            // Auto-scroll bei neuen Nachrichten
+                            if app.auto_scroll {
+                                app.scroll_to_bottom();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         terminal.draw(|f| {
             // Fixed input height of 5 lines
             let input_height = 5u16;
@@ -860,55 +908,8 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         })?;
 
-        // Poll server für neue Nachrichten (alle 2 Sekunden, wenn nicht loading)
-        if !app.loading && app.last_poll.elapsed().as_secs() >= 2 {
-            app.last_poll = Instant::now();
-            let server_url = app.server_url.clone();
-            let since = app.last_timestamp;
-            
-            // Non-blocking poll
-            if let Ok(response) = reqwest::Client::new()
-                .get(format!("{}/messages?since={}", server_url, since))
-                .timeout(std::time::Duration::from_secs(2))
-                .send()
-                .await
-            {
-                if let Ok(messages) = response.json::<Vec<ServerMessage>>().await {
-                    for msg in messages {
-                        // Nur hinzufügen wenn noch nicht vorhanden
-                        let already_exists = app.messages.iter().any(|m| {
-                            m.timestamp_ms == Some(msg.timestamp) && m.role == msg.role
-                        });
-                        
-                        if !already_exists {
-                            let timestamp_str = chrono::Local
-                                .timestamp_millis_opt(msg.timestamp as i64)
-                                .single()
-                                .map(|dt| dt.format("%H:%M:%S").to_string())
-                                .unwrap_or_else(|| "??:??:??".to_string());
-                            
-                            app.messages.push(Message {
-                                role: msg.role,
-                                content: msg.content,
-                                timestamp: timestamp_str,
-                                timestamp_ms: Some(msg.timestamp),
-                            });
-                            
-                            if msg.timestamp > app.last_timestamp {
-                                app.last_timestamp = msg.timestamp;
-                            }
-                            
-                            // Auto-scroll bei neuen Nachrichten
-                            if app.auto_scroll {
-                                app.scroll_to_bottom();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Kürzeres Poll-Timeout für schnelleres UI-Update
+        if event::poll(std::time::Duration::from_millis(500))? {
             if let Event::Key(key) = event::read()? {
                 // Only process key press events, not release events
                 if key.kind != KeyEventKind::Press {
