@@ -742,22 +742,36 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
 
             // Calculate scroll offset for chat
-            // Note: We count Line objects, not wrapped lines. This is approximate.
-            // For very long messages, scrolling may not be perfect.
+            // Count actual lines after wrapping by simulating what ratatui does
             let chat_width = chunks[0].width.saturating_sub(2) as usize;
             
-            // Estimate total lines including wrapping
             let mut total_lines: u16 = 0;
-            for line in &lines {
-                let line_len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-                if chat_width > 0 && line_len > chat_width {
-                    total_lines += ((line_len + chat_width - 1) / chat_width) as u16;
-                } else {
-                    total_lines += 1;
+            if chat_width > 0 {
+                for line in &lines {
+                    // Get the full text of this line
+                    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    
+                    if text.is_empty() {
+                        total_lines += 1;
+                    } else {
+                        // Count how many display lines this takes
+                        let mut col = 0;
+                        let mut line_count = 1u16;
+                        for ch in text.chars() {
+                            let char_width = ch.width().unwrap_or(1);
+                            if col + char_width > chat_width {
+                                line_count += 1;
+                                col = char_width;
+                            } else {
+                                col += char_width;
+                            }
+                        }
+                        total_lines += line_count;
+                    }
                 }
+            } else {
+                total_lines = lines.len() as u16;
             }
-            // Add extra lines for safety margin (markdown formatting, etc.)
-            total_lines = total_lines.saturating_add(3);
             
             let visible_lines = chunks[0].height.saturating_sub(2);
             let max_scroll = total_lines.saturating_sub(visible_lines);
