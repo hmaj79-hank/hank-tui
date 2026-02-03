@@ -742,7 +742,21 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
 
             // Calculate scroll offset for chat
-            let total_lines = lines.len() as u16;
+            // Note: We count Line objects, not wrapped lines. This is approximate.
+            // For very long messages, scrolling may not be perfect.
+            let chat_width = chunks[0].width.saturating_sub(2) as usize;
+            
+            // Estimate total lines including wrapping
+            let mut total_lines: u16 = 0;
+            for line in &lines {
+                let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+                if chat_width > 0 && line_len > chat_width {
+                    total_lines += ((line_len + chat_width - 1) / chat_width) as u16;
+                } else {
+                    total_lines += 1;
+                }
+            }
+            
             let visible_lines = chunks[0].height.saturating_sub(2);
             let max_scroll = total_lines.saturating_sub(visible_lines);
             
