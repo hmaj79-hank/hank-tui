@@ -664,10 +664,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 
+                let msg_count = app.messages.len();
                 let source = if had_local { "Server (ersetzt lokale Historie)" } else { "Server" };
                 app.messages.push(Message {
                     role: "system".to_string(),
-                    content: format!("{} Nachrichten vom {} geladen", app.messages.len() - 1, source),
+                    content: format!("{} Nachrichten vom {} geladen", msg_count, source),
                     timestamp: Local::now().format("%H:%M:%S").to_string(),
                     timestamp_ms: Some(now_ms()),
                 });
