@@ -852,8 +852,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 total_lines = lines.len() as u16;
             }
             
-            // Add safety margin for any edge cases
-            total_lines = total_lines.saturating_add(5);
+            // Add safety margin for any edge cases (large to avoid truncation)
+            total_lines = total_lines.saturating_add(200);
             
             let visible_lines = chunks[0].height.saturating_sub(2);
             let max_scroll = total_lines.saturating_sub(visible_lines);
