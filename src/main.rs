@@ -313,6 +313,30 @@ impl App {
             self.auto_scroll = true;
         }
     }
+
+    fn scroll_page_up(&mut self, amount: u16) {
+        self.auto_scroll = false;
+        self.scroll = self.scroll.saturating_add(amount.max(1));
+    }
+
+    fn scroll_page_down(&mut self, amount: u16) {
+        if self.scroll > amount {
+            self.scroll = self.scroll.saturating_sub(amount);
+        } else {
+            self.scroll = 0;
+            self.auto_scroll = true;
+        }
+    }
+
+    fn jump_to_top(&mut self) {
+        self.auto_scroll = false;
+        self.scroll = u16::MAX;
+    }
+
+    fn jump_to_bottom(&mut self) {
+        self.scroll = 0;
+        self.auto_scroll = true;
+    }
     
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
@@ -665,7 +689,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
                 
                 let msg_count = app.messages.len();
-                let source = if had_local { "Server (ersetzt lokale Historie)" } else { "Server" };
+                let source = "Server";
                 app.messages.push(Message {
                     role: "system".to_string(),
                     content: format!("{} Nachrichten vom {} geladen", msg_count, source),
@@ -938,6 +962,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                     Line::from(Span::styled("── Eingabe (Input fokussiert) ──", Style::default().fg(Color::Cyan))),
                     Line::from("  Ctrl+S        Nachricht senden"),
                     Line::from("  Enter         Neue Zeile"),
+                    Line::from(""),
+                    Line::from(Span::styled("── Chat Scroll ──", Style::default().fg(Color::Cyan))),
+                    Line::from("  Tab           Chat fokussieren"),
+                    Line::from("  ↑/↓           Zeilenweise scrollen"),
+                    Line::from("  PageUp/Down   Seitenweise scrollen"),
+                    Line::from("  Home/End      Anfang/Ende"),
                     Line::from("  Ctrl+V        Einfügen aus Zwischenablage"),
                     Line::from("  ↑/↓           Cursor zwischen Zeilen bewegen"),
                     Line::from("  ←/→           Cursor links/rechts"),
@@ -952,7 +982,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     Line::from(""),
                     Line::from(Span::styled("── Sonstiges ──", Style::default().fg(Color::Cyan))),
                     Line::from("  Alt+↑/↓       Chat scrollen (immer)"),
-                    Line::from("  Ctrl+L        Chat löschen (nur Anzeige)"),
+                    Line::from("  Ctrl+L        Chat löschen (Server + lokal)"),
                     Line::from("  Ctrl+Shift+D  History-Datei löschen"),
                     Line::from(""),
                     Line::from(Span::styled("Drücke eine beliebige Taste zum Schließen", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
@@ -1021,15 +1051,26 @@ async fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Clear chat
-                        app.messages.clear();
-                        app.messages.push(Message {
-                            role: "system".to_string(),
-                            content: format!("Chat gelöscht. Verbunden mit {}", app.server_url),
-                            timestamp: Local::now().format("%H:%M:%S").to_string(),
-                        timestamp_ms: Some(now_ms()),
-                        });
-                        app.last_error = None;
+                        // Clear chat (server + local)
+                        let url = format!("{}/messages/clear", app.server_url);
+                        match reqwest::Client::new().post(url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                app.messages.clear();
+                                app.messages.push(Message {
+                                    role: "system".to_string(),
+                                    content: format!("Chat gelöscht (Server + lokal). Verbunden mit {}", app.server_url),
+                                    timestamp: Local::now().format("%H:%M:%S").to_string(),
+                                    timestamp_ms: Some(now_ms()),
+                                });
+                                app.last_error = None;
+                            }
+                            Ok(resp) => {
+                                app.last_error = Some(format!("Clear fehlgeschlagen: {}", resp.status()));
+                            }
+                            Err(e) => {
+                                app.last_error = Some(format!("Clear fehlgeschlagen: {}", e));
+                            }
+                        }
                     }
                     KeyCode::Char('d') | KeyCode::Char('D') 
                         if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
@@ -1192,22 +1233,16 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.scroll_down();
                     }
                     KeyCode::Home if app.focus == Focus::Chat => {
-                        app.auto_scroll = false;
-                        app.scroll = u16::MAX; // Will be clamped during render
+                        app.jump_to_top();
                     }
                     KeyCode::End if app.focus == Focus::Chat => {
-                        app.scroll_to_bottom();
+                        app.jump_to_bottom();
                     }
-                    KeyCode::PageUp => {
-                        app.auto_scroll = false;
-                        app.scroll = app.scroll.saturating_add(10);
+                    KeyCode::PageUp if app.focus == Focus::Chat => {
+                        app.scroll_page_up(10);
                     }
-                    KeyCode::PageDown => {
-                        if app.scroll > 10 {
-                            app.scroll = app.scroll.saturating_sub(10);
-                        } else {
-                            app.scroll_to_bottom();
-                        }
+                    KeyCode::PageDown if app.focus == Focus::Chat => {
+                        app.scroll_page_down(10);
                     }
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Send message with Ctrl+S (alternative to Ctrl+Enter)
