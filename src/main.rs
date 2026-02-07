@@ -718,6 +718,14 @@ async fn run_app<B: ratatui::backend::Backend>(
             {
                 if let Ok(messages) = response.json::<Vec<ServerMessage>>().await {
                     for msg in messages {
+                        // Skip echo of user messages coming back from server
+                        if msg.role == "user" {
+                            if msg.timestamp > app.last_timestamp {
+                                app.last_timestamp = msg.timestamp;
+                            }
+                            continue;
+                        }
+
                         // Nur hinzufügen wenn noch nicht vorhanden
                         let already_exists = app.messages.iter().any(|m| {
                             m.timestamp_ms == Some(msg.timestamp) && m.role == msg.role
