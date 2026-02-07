@@ -982,7 +982,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     Line::from(""),
                     Line::from(Span::styled("── Sonstiges ──", Style::default().fg(Color::Cyan))),
                     Line::from("  Alt+↑/↓       Chat scrollen (immer)"),
-                    Line::from("  Ctrl+L        Chat löschen (nur Anzeige)"),
+                    Line::from("  Ctrl+L        Chat löschen (Server + lokal)"),
                     Line::from("  Ctrl+Shift+D  History-Datei löschen"),
                     Line::from(""),
                     Line::from(Span::styled("Drücke eine beliebige Taste zum Schließen", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
@@ -1051,15 +1051,26 @@ async fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Clear chat
-                        app.messages.clear();
-                        app.messages.push(Message {
-                            role: "system".to_string(),
-                            content: format!("Chat gelöscht. Verbunden mit {}", app.server_url),
-                            timestamp: Local::now().format("%H:%M:%S").to_string(),
-                        timestamp_ms: Some(now_ms()),
-                        });
-                        app.last_error = None;
+                        // Clear chat (server + local)
+                        let url = format!("{}/messages/clear", app.server_url);
+                        match reqwest::Client::new().post(url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                app.messages.clear();
+                                app.messages.push(Message {
+                                    role: "system".to_string(),
+                                    content: format!("Chat gelöscht (Server + lokal). Verbunden mit {}", app.server_url),
+                                    timestamp: Local::now().format("%H:%M:%S").to_string(),
+                                    timestamp_ms: Some(now_ms()),
+                                });
+                                app.last_error = None;
+                            }
+                            Ok(resp) => {
+                                app.last_error = Some(format!("Clear fehlgeschlagen: {}", resp.status()));
+                            }
+                            Err(e) => {
+                                app.last_error = Some(format!("Clear fehlgeschlagen: {}", e));
+                            }
+                        }
                     }
                     KeyCode::Char('d') | KeyCode::Char('D') 
                         if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
