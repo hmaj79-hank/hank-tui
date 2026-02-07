@@ -15,7 +15,7 @@ use ratatui::{
     Terminal,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, io, panic, path::PathBuf, time::Instant};
+use std::{env, fs, io, panic, path::PathBuf, time::Instant};
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Parser, Debug)]
@@ -164,6 +164,7 @@ struct App {
     history_enabled: bool,
     last_timestamp: u64,
     last_poll: Instant,
+    debug_overlay: bool,
 }
 
 #[derive(Serialize)]
@@ -178,7 +179,7 @@ struct ChatResponse {
     complete: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ServerMessage {
     role: String,
     content: String,
@@ -254,6 +255,7 @@ impl App {
             history_enabled,
             last_timestamp,
             last_poll: Instant::now(),
+            debug_overlay: false,
         }
     }
 
@@ -593,6 +595,94 @@ fn format_timestamp(ms: u64) -> String {
     }
 }
 
+fn wrapped_line_count(lines: &[Line], width: usize) -> u32 {
+    if width == 0 {
+        return lines.len() as u32;
+    }
+
+    let mut total: u32 = 0;
+    for line in lines {
+        if line.spans.is_empty() {
+            total = total.saturating_add(1);
+            continue;
+        }
+
+        let mut col = 0usize;
+        let mut line_count: u32 = 1;
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                let char_width = ch.width().unwrap_or(1);
+                if char_width == 0 {
+                    continue;
+                }
+                if col + char_width > width {
+                    line_count = line_count.saturating_add(1);
+                    col = char_width;
+                } else {
+                    col += char_width;
+                }
+            }
+        }
+
+        total = total.saturating_add(line_count);
+    }
+
+    total
+}
+
+const CHAT_PADDING_LINES: u32 = 20;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scroll_values(lines: &[Line], width: usize, visible_lines: u16, auto_scroll: bool, scroll: u16) -> (u16, u16, u32) {
+        let total_lines: u32 = wrapped_line_count(lines, width).saturating_add(CHAT_PADDING_LINES);
+        let visible_lines_u32 = visible_lines as u32;
+        let max_scroll_u32 = total_lines.saturating_sub(visible_lines_u32);
+        let max_scroll: u16 = max_scroll_u32.min(u32::from(u16::MAX)) as u16;
+
+        let scroll_offset = if total_lines <= visible_lines_u32 {
+            0
+        } else if auto_scroll {
+            max_scroll
+        } else {
+            max_scroll.saturating_sub(scroll)
+        };
+
+        (max_scroll, scroll_offset, total_lines)
+    }
+
+    #[test]
+    fn counts_wrapped_lines_basic() {
+        let lines = vec![Line::from("12345"), Line::from("1234567890")]; // second wraps once at width 8
+        let total = wrapped_line_count(&lines, 8);
+        assert_eq!(total, 3); // two logical + one wrapped
+    }
+
+    #[test]
+    fn counts_wrapped_lines_unicode_width() {
+        let lines = vec![Line::from("😀abc")]; // emoji width 2
+        let total = wrapped_line_count(&lines, 3); // 2+1 exceeds 3, so wrap after emoji
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn scroll_auto_goes_to_max_with_padding() {
+        let lines = vec![Line::from("one"), Line::from("two"), Line::from("three")];
+        let (max_scroll, scroll_offset, total) = scroll_values(&lines, 10, 2, true, 0);
+        assert!(total > wrapped_line_count(&lines, 10)); // padding applied
+        assert_eq!(scroll_offset, max_scroll);
+    }
+
+    #[test]
+    fn manual_scroll_clamps() {
+        let lines = vec![Line::from("short"), Line::from("another short line"), Line::from("last")];
+        let (max_scroll, scroll_offset, _) = scroll_values(&lines, 10, 2, false, 5);
+        assert!(max_scroll >= scroll_offset);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -665,6 +755,15 @@ async fn run_app<B: ratatui::backend::Backend>(
             .await
         {
             if let Ok(messages) = response.json::<Vec<ServerMessage>>().await {
+                // Dump initial payload next to the executable for debugging
+                if let Ok(exe_path) = env::current_exe() {
+                    if let Some(dir) = exe_path.parent() {
+                        if let Ok(serialized) = serde_json::to_string_pretty(&messages) {
+                            let _ = fs::write(dir.join("initial_messages.json"), serialized);
+                        }
+                    }
+                }
+
                 // Clear local history and load from server
                 let had_local = !app.messages.is_empty();
                 app.messages.clear();
@@ -718,18 +817,25 @@ async fn run_app<B: ratatui::backend::Backend>(
             {
                 if let Ok(messages) = response.json::<Vec<ServerMessage>>().await {
                     for msg in messages {
-                        // Skip echo of user messages coming back from server
+                        // Skip only if we already have this exact message (avoid echo duplicates)
                         if msg.role == "user" {
                             if msg.timestamp > app.last_timestamp {
                                 app.last_timestamp = msg.timestamp;
                             }
-                            continue;
+                            let already_exists = app
+                                .messages
+                                .iter()
+                                .any(|m| m.role == msg.role && m.timestamp_ms == Some(msg.timestamp));
+                            if already_exists {
+                                continue;
+                            }
                         }
 
-                        // Nur hinzufügen wenn noch nicht vorhanden
-                        let already_exists = app.messages.iter().any(|m| {
-                            m.timestamp_ms == Some(msg.timestamp) && m.role == msg.role
-                        });
+                        // Nur hinzufügen wenn noch nicht vorhanden (exact role+timestamp)
+                        let already_exists = app
+                            .messages
+                            .iter()
+                            .any(|m| m.role == msg.role && m.timestamp_ms == Some(msg.timestamp));
                         
                         if !already_exists {
                             let timestamp_str = chrono::Local
@@ -820,51 +926,25 @@ async fn run_app<B: ratatui::backend::Backend>(
                 )));
             }
 
-            // Calculate scroll offset for chat
-            // Count actual lines after wrapping by simulating what ratatui does
+            // Calculate scroll offset for chat using the same wrapping logic as rendering
             let chat_width = chunks[0].width.saturating_sub(2) as usize;
-            
-            let mut total_lines: u16 = 0;
-            if chat_width > 0 {
-                for line in &lines {
-                    // Get the full text of this line
-                    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                    
-                    if text.is_empty() {
-                        total_lines += 1;
-                    } else {
-                        // Count how many display lines this takes
-                        let mut col = 0;
-                        let mut line_count = 1u16;
-                        for ch in text.chars() {
-                            let char_width = ch.width().unwrap_or(1);
-                            if col + char_width > chat_width {
-                                line_count += 1;
-                                col = char_width;
-                            } else {
-                                col += char_width;
-                            }
-                        }
-                        total_lines += line_count;
-                    }
-                }
-            } else {
-                total_lines = lines.len() as u16;
-            }
-            
-            // Add safety margin for any edge cases (large to avoid truncation)
-            total_lines = total_lines.saturating_add(30);
-            
             let visible_lines = chunks[0].height.saturating_sub(2);
-            let max_scroll = total_lines.saturating_sub(visible_lines);
-            
-            let scroll_offset = if app.auto_scroll {
+            let total_lines: u32 = wrapped_line_count(&lines, chat_width)
+                .saturating_add(CHAT_PADDING_LINES);
+            let visible_lines_u32 = visible_lines as u32;
+            let max_scroll_u32 = total_lines.saturating_sub(visible_lines_u32);
+            let max_scroll: u16 = max_scroll_u32.min(u32::from(u16::MAX)) as u16;
+
+            // Clamp stored scroll to max
+            if app.scroll > max_scroll {
+                app.scroll = max_scroll;
+            }
+
+            let scroll_offset = if total_lines <= visible_lines_u32 {
+                0
+            } else if app.auto_scroll {
                 max_scroll
             } else {
-                // Clamp scroll to valid range and update app.scroll
-                if app.scroll > max_scroll {
-                    app.scroll = max_scroll;
-                }
                 max_scroll.saturating_sub(app.scroll)
             };
 
@@ -934,7 +1014,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.messages.len(),
                 total_lines,
                 visible_lines,
-                scroll_offset,
+                if app.auto_scroll { "bottom".to_string() } else { app.scroll.to_string() },
                 app.connection_status
             );
             let status_widget = Paragraph::new(status_text)
@@ -1025,6 +1105,44 @@ async fn run_app<B: ratatui::backend::Backend>(
                     f.render_widget(help_widget, help_area);
                 }
             }
+
+            // Debug overlay (toggle with F2)
+            if app.debug_overlay {
+                let dbg_lines = vec![
+                    Line::from(format!(
+                        "tl={} vis={} max={} off={}",
+                        total_lines, visible_lines, max_scroll, scroll_offset
+                    )),
+                    Line::from(format!(
+                        "auto={} scroll={} pad={}",
+                        app.auto_scroll, app.scroll, CHAT_PADDING_LINES
+                    )),
+                    Line::from(format!("msgs={} loading={}", app.messages.len(), app.loading)),
+                ];
+
+                let term_width = f.area().width;
+                let term_height = f.area().height;
+                let dbg_width = 48u16.min(term_width.saturating_sub(2));
+                let dbg_height = (dbg_lines.len() as u16 + 2).min(term_height.saturating_sub(2));
+                let dbg_x = term_width.saturating_sub(dbg_width + 1);
+                let dbg_y = term_height.saturating_sub(dbg_height + 1);
+
+                if dbg_width > 2 && dbg_height > 2 {
+                    let dbg_area = ratatui::layout::Rect::new(dbg_x, dbg_y, dbg_width, dbg_height);
+                    f.render_widget(ratatui::widgets::Clear, dbg_area);
+
+                    let dbg_block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(" debug ")
+                        .border_style(Style::default().fg(Color::Magenta))
+                        .style(Style::default().bg(Color::Black));
+
+                    let dbg_widget = Paragraph::new(dbg_lines)
+                        .block(dbg_block)
+                        .wrap(Wrap { trim: false });
+                    f.render_widget(dbg_widget, dbg_area);
+                }
+            }
         })?;
 
         // Kürzeres Poll-Timeout für schnelleres UI-Update (100ms statt 500ms)
@@ -1052,6 +1170,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                 match key.code {
                     KeyCode::F(1) => {
                         app.toggle_help();
+                    }
+                    KeyCode::F(2) => {
+                        app.debug_overlay = !app.debug_overlay;
                     }
                     KeyCode::Char('?') if key.modifiers.is_empty() && app.focus != Focus::Input => {
                         app.toggle_help();
