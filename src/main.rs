@@ -313,6 +313,30 @@ impl App {
             self.auto_scroll = true;
         }
     }
+
+    fn scroll_page_up(&mut self, amount: u16) {
+        self.auto_scroll = false;
+        self.scroll = self.scroll.saturating_add(amount.max(1));
+    }
+
+    fn scroll_page_down(&mut self, amount: u16) {
+        if self.scroll > amount {
+            self.scroll = self.scroll.saturating_sub(amount);
+        } else {
+            self.scroll = 0;
+            self.auto_scroll = true;
+        }
+    }
+
+    fn jump_to_top(&mut self) {
+        self.auto_scroll = false;
+        self.scroll = u16::MAX;
+    }
+
+    fn jump_to_bottom(&mut self) {
+        self.scroll = 0;
+        self.auto_scroll = true;
+    }
     
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
@@ -938,6 +962,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                     Line::from(Span::styled("── Eingabe (Input fokussiert) ──", Style::default().fg(Color::Cyan))),
                     Line::from("  Ctrl+S        Nachricht senden"),
                     Line::from("  Enter         Neue Zeile"),
+                    Line::from(""),
+                    Line::from(Span::styled("── Chat Scroll ──", Style::default().fg(Color::Cyan))),
+                    Line::from("  Tab           Chat fokussieren"),
+                    Line::from("  ↑/↓           Zeilenweise scrollen"),
+                    Line::from("  PageUp/Down   Seitenweise scrollen"),
+                    Line::from("  Home/End      Anfang/Ende"),
                     Line::from("  Ctrl+V        Einfügen aus Zwischenablage"),
                     Line::from("  ↑/↓           Cursor zwischen Zeilen bewegen"),
                     Line::from("  ←/→           Cursor links/rechts"),
@@ -1192,22 +1222,16 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.scroll_down();
                     }
                     KeyCode::Home if app.focus == Focus::Chat => {
-                        app.auto_scroll = false;
-                        app.scroll = u16::MAX; // Will be clamped during render
+                        app.jump_to_top();
                     }
                     KeyCode::End if app.focus == Focus::Chat => {
-                        app.scroll_to_bottom();
+                        app.jump_to_bottom();
                     }
-                    KeyCode::PageUp => {
-                        app.auto_scroll = false;
-                        app.scroll = app.scroll.saturating_add(10);
+                    KeyCode::PageUp if app.focus == Focus::Chat => {
+                        app.scroll_page_up(10);
                     }
-                    KeyCode::PageDown => {
-                        if app.scroll > 10 {
-                            app.scroll = app.scroll.saturating_sub(10);
-                        } else {
-                            app.scroll_to_bottom();
-                        }
+                    KeyCode::PageDown if app.focus == Focus::Chat => {
+                        app.scroll_page_down(10);
                     }
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Send message with Ctrl+S (alternative to Ctrl+Enter)
