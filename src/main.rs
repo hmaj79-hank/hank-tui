@@ -18,6 +18,30 @@ use serde::{Deserialize, Serialize};
 use std::{env, fs, io, panic, path::PathBuf, time::Instant};
 use unicode_width::UnicodeWidthChar;
 
+#[cfg(windows)]
+fn enable_windows_utf8() {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleCP, SetConsoleMode, SetConsoleOutputCP,
+        ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+    };
+
+    const UTF8_CODEPAGE: u32 = 65001;
+
+    unsafe {
+        let _ = SetConsoleOutputCP(UTF8_CODEPAGE);
+        let _ = SetConsoleCP(UTF8_CODEPAGE);
+
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if out != 0 && out != INVALID_HANDLE_VALUE {
+            let mut mode: u32 = 0;
+            if GetConsoleMode(out, &mut mode) != 0 {
+                let _ = SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT);
+            }
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "hank-tui")]
 #[command(about = "Terminal UI for Hank chat server", long_about = None)]
@@ -637,15 +661,16 @@ mod tests {
     use super::*;
 
     fn scroll_values(lines: &[Line], width: usize, visible_lines: u16, auto_scroll: bool, scroll: u16) -> (u16, u16, u32) {
-        let total_lines: u32 = wrapped_line_count(lines, width).saturating_add(CHAT_PADDING_LINES);
+        let actual_lines: u32 = wrapped_line_count(lines, width);
+        let total_lines: u32 = actual_lines.saturating_add(CHAT_PADDING_LINES);
         let visible_lines_u32 = visible_lines as u32;
         let max_scroll_u32 = total_lines.saturating_sub(visible_lines_u32);
         let max_scroll: u16 = max_scroll_u32.min(u32::from(u16::MAX)) as u16;
 
-        let scroll_offset = if total_lines <= visible_lines_u32 {
+        let scroll_offset = if actual_lines <= visible_lines_u32 {
             0
         } else if auto_scroll {
-            max_scroll
+            actual_lines.saturating_sub(visible_lines_u32).min(u32::from(u16::MAX)) as u16
         } else {
             max_scroll.saturating_sub(scroll)
         };
@@ -671,8 +696,11 @@ mod tests {
     fn scroll_auto_goes_to_max_with_padding() {
         let lines = vec![Line::from("one"), Line::from("two"), Line::from("three")];
         let (max_scroll, scroll_offset, total) = scroll_values(&lines, 10, 2, true, 0);
-        assert!(total > wrapped_line_count(&lines, 10)); // padding applied
-        assert_eq!(scroll_offset, max_scroll);
+        assert!(total > wrapped_line_count(&lines, 10)); // padding applied to total/max_scroll
+        // auto_scroll uses actual content lines (no padding), so scroll_offset < max_scroll
+        let actual = wrapped_line_count(&lines, 10);
+        assert_eq!(scroll_offset, actual.saturating_sub(2) as u16);
+        assert!(scroll_offset < max_scroll);
     }
 
     #[test]
@@ -685,6 +713,9 @@ mod tests {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    enable_windows_utf8();
+
     let args = Args::parse();
     let mut config = Config::load();
     
@@ -817,18 +848,12 @@ async fn run_app<B: ratatui::backend::Backend>(
             {
                 if let Ok(messages) = response.json::<Vec<ServerMessage>>().await {
                     for msg in messages {
-                        // Skip only if we already have this exact message (avoid echo duplicates)
+                        // Always skip user messages from poll — they are added locally on send
                         if msg.role == "user" {
                             if msg.timestamp > app.last_timestamp {
                                 app.last_timestamp = msg.timestamp;
                             }
-                            let already_exists = app
-                                .messages
-                                .iter()
-                                .any(|m| m.role == msg.role && m.timestamp_ms == Some(msg.timestamp));
-                            if already_exists {
-                                continue;
-                            }
+                            continue;
                         }
 
                         // Nur hinzufügen wenn noch nicht vorhanden (exact role+timestamp)
@@ -929,8 +954,8 @@ async fn run_app<B: ratatui::backend::Backend>(
             // Calculate scroll offset for chat using the same wrapping logic as rendering
             let chat_width = chunks[0].width.saturating_sub(2) as usize;
             let visible_lines = chunks[0].height.saturating_sub(2);
-            let total_lines: u32 = wrapped_line_count(&lines, chat_width)
-                .saturating_add(CHAT_PADDING_LINES);
+            let actual_lines: u32 = wrapped_line_count(&lines, chat_width);
+            let total_lines: u32 = actual_lines.saturating_add(CHAT_PADDING_LINES);
             let visible_lines_u32 = visible_lines as u32;
             let max_scroll_u32 = total_lines.saturating_sub(visible_lines_u32);
             let max_scroll: u16 = max_scroll_u32.min(u32::from(u16::MAX)) as u16;
@@ -940,10 +965,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.scroll = max_scroll;
             }
 
-            let scroll_offset = if total_lines <= visible_lines_u32 {
+            // auto_scroll uses actual content lines (no padding) to avoid over-scrolling past content
+            let scroll_offset = if actual_lines <= visible_lines_u32 {
                 0
             } else if app.auto_scroll {
-                max_scroll
+                actual_lines.saturating_sub(visible_lines_u32).min(u32::from(u16::MAX)) as u16
             } else {
                 max_scroll.saturating_sub(app.scroll)
             };
@@ -1410,9 +1436,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 
                                 match result {
                                     Ok(response) => {
-                                        match response.json::<ChatResponse>().await {
-                                            Ok(data) => Ok(data.content),
-                                            Err(e) => Err(format!("Failed to parse response: {}", e)),
+                                        match response.text().await {
+                                            Ok(body) => {
+                                                match serde_json::from_str::<ChatResponse>(&body) {
+                                                    Ok(data) => Ok(data.content),
+                                                    Err(e) => Err(format!("Failed to parse response: {}\n\nRaw response:\n{}", e, body)),
+                                                }
+                                            }
+                                            Err(e) => Err(format!("Failed to read response body: {}", e)),
                                         }
                                     }
                                     Err(e) => Err(format!("Connection error: {}", e)),
@@ -1456,10 +1487,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         Style::default().fg(Color::Yellow),
                                     )));
 
-                                    // Auto-scroll to bottom
-                                    let total_lines = lines.len() as u16;
+                                    // Auto-scroll to bottom using wrapped line count
+                                    let chat_width = chunks[0].width.saturating_sub(2) as usize;
+                                    let actual_lines: u32 = wrapped_line_count(&lines, chat_width);
                                     let visible_lines = chunks[0].height.saturating_sub(2);
-                                    let scroll_offset = total_lines.saturating_sub(visible_lines);
+                                    let scroll_offset: u16 = actual_lines.saturating_sub(visible_lines as u32).min(u32::from(u16::MAX)) as u16;
 
                                     let messages = Paragraph::new(lines)
                                         .block(Block::default().borders(Borders::ALL).title(" Chat "))
@@ -1559,9 +1591,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 
                                 match result {
                                     Ok(response) => {
-                                        match response.json::<ChatResponse>().await {
-                                            Ok(data) => Ok(data.content),
-                                            Err(e) => Err(format!("Failed to parse response: {}", e)),
+                                        match response.text().await {
+                                            Ok(body) => {
+                                                match serde_json::from_str::<ChatResponse>(&body) {
+                                                    Ok(data) => Ok(data.content),
+                                                    Err(e) => Err(format!("Failed to parse response: {}\n\nRaw response:\n{}", e, body)),
+                                                }
+                                            }
+                                            Err(e) => Err(format!("Failed to read response body: {}", e)),
                                         }
                                     }
                                     Err(e) => Err(format!("Connection error: {}", e)),
@@ -1605,10 +1642,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         Style::default().fg(Color::Yellow),
                                     )));
 
-                                    // Auto-scroll to bottom
-                                    let total_lines = lines.len() as u16;
+                                    // Auto-scroll to bottom using wrapped line count
+                                    let chat_width = chunks[0].width.saturating_sub(2) as usize;
+                                    let actual_lines: u32 = wrapped_line_count(&lines, chat_width);
                                     let visible_lines = chunks[0].height.saturating_sub(2);
-                                    let scroll_offset = total_lines.saturating_sub(visible_lines);
+                                    let scroll_offset: u16 = actual_lines.saturating_sub(visible_lines as u32).min(u32::from(u16::MAX)) as u16;
 
                                     let messages = Paragraph::new(lines)
                                         .block(Block::default().borders(Borders::ALL).title(" Chat "))
